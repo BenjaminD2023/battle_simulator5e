@@ -21,7 +21,6 @@ import {
   MousePointer2,
   Move,
   MoreVertical,
-  Pause,
   Pencil,
   Play,
   Plus,
@@ -79,7 +78,7 @@ import {
   type SrdRace,
   type SrdSpell,
 } from './lib/srdApi'
-import { readCache, readJsonState, writeCache, writeJsonState } from './lib/storage'
+import { deleteCache, readCache, readJsonState, writeCache, writeJsonState } from './lib/storage'
 import type {
   ActiveEffect,
   ActionDefinition,
@@ -116,6 +115,37 @@ type MapView = {
   panY: number
 }
 
+type MapAnnotation =
+  | {
+      id: string
+      tool: 'draw'
+      color: string
+      points: MapPixelPoint[]
+    }
+  | {
+      id: string
+      tool: 'square' | 'circle'
+      color: string
+      center: MapPixelPoint
+      widthCells: number
+      heightCells: number
+      fitToGrid: boolean
+    }
+
+type TacticalMapState = {
+  activeMapTool: MapTool
+  mapView: MapView
+  measurement?: { from: GridPoint; to?: GridPoint }
+  annotations: MapAnnotation[]
+  showAnnotations: boolean
+  toolsHidden: boolean
+  drawColor: string
+  shapeColor: string
+  shapeWidthCells: number
+  shapeHeightCells: number
+  shapeFitToGrid: boolean
+}
+
 type GestureLikeEvent = Event & {
   scale?: number
   clientX?: number
@@ -138,6 +168,9 @@ const zoomViewAtPoint = (view: MapView, nextZoom: number, anchor: MapPixelPoint)
     panY: anchor.y - mapY * zoom,
   }
 }
+
+const resolveStateUpdate = <T,>(update: React.SetStateAction<T>, current: T) =>
+  typeof update === 'function' ? (update as (value: T) => T)(current) : update
 
 const calibrationWithDetection = (
   current: GridCalibration,
@@ -171,23 +204,6 @@ const midpoint = (a: MapPixelPoint, b: MapPixelPoint): MapPixelPoint => ({
 })
 
 const pointDistance = (a: MapPixelPoint, b: MapPixelPoint) => Math.hypot(a.x - b.x, a.y - b.y)
-
-type MapAnnotation =
-  | {
-      id: string
-      tool: 'draw'
-      color: string
-      points: MapPixelPoint[]
-    }
-  | {
-      id: string
-      tool: 'square' | 'circle'
-      color: string
-      center: MapPixelPoint
-      widthCells: number
-      heightCells: number
-      fitToGrid: boolean
-    }
 
 type DraftAction = {
   id: string
@@ -272,6 +288,10 @@ const libraryKey = 'battle-sim-5e:library:v1'
 const battleKey = 'battle-sim-5e:battle:v1'
 const mapKey = 'battle-sim-5e:map:v1'
 const mapImageCacheKey = 'battle-sim-5e:map-image:v1'
+const tacticalMapKey = 'battle-sim-5e:tactical-map:v1'
+const encounterNameKey = 'battle-sim-5e:encounter-name:v1'
+const encounterFileSchema = 'battle-simulator-5e.encounter'
+const defaultEncounterName = 'Ruined Watchtower'
 type LibraryTab = 'library' | 'custom' | 'character' | 'json'
 type AppPage = 'battlefield' | 'combatants' | 'library'
 
@@ -283,6 +303,32 @@ type PersistedMapImage = {
   lastModified: number
   width?: number
   height?: number
+}
+
+type EncounterMapImage = Omit<PersistedMapImage, 'blob'> & {
+  dataUrl: string
+}
+
+type EncounterSaveFile = {
+  schema: typeof encounterFileSchema
+  version: 1
+  savedAt: string
+  state: {
+    library: ContentEntry[]
+    battle: BattleState
+    battleMap: Omit<BattleMap, 'imageUrl'>
+    mapImage?: EncounterMapImage
+    tacticalMap: TacticalMapState
+    ui: {
+      activePage: AppPage
+      activeLibraryTab: LibraryTab
+      inspectorTab: InspectorTab
+      encounterName?: string
+      srdQuery: string
+      draft: DraftContent
+      srdCharacter: SrdCharacterDraft
+    }
+  }
 }
 
 const strategies: Strategy[] = ['manual', 'nearest', 'focusWeak', 'holdLine', 'protectAllies']
@@ -1275,6 +1321,141 @@ const readInitialBattleMap = () => {
   }
 }
 
+const createDefaultTacticalMapState = (): TacticalMapState => ({
+  activeMapTool: 'mouse',
+  mapView: { zoom: 1, panX: 0, panY: 0 },
+  measurement: undefined,
+  annotations: [],
+  showAnnotations: true,
+  toolsHidden: false,
+  drawColor: '#f0c37b',
+  shapeColor: '#7db9ff',
+  shapeWidthCells: 3,
+  shapeHeightCells: 3,
+  shapeFitToGrid: true,
+})
+
+const normalizeTacticalMapState = (state: Partial<TacticalMapState> | undefined): TacticalMapState => {
+  const defaults = createDefaultTacticalMapState()
+
+  return {
+    ...defaults,
+    ...(state ?? {}),
+    activeMapTool: state?.activeMapTool ?? defaults.activeMapTool,
+    mapView: {
+      ...defaults.mapView,
+      ...(state?.mapView ?? {}),
+      zoom: clampMapZoom(state?.mapView?.zoom ?? defaults.mapView.zoom),
+    },
+    annotations: Array.isArray(state?.annotations) ? state.annotations : defaults.annotations,
+    measurement: state?.measurement,
+    showAnnotations: state?.showAnnotations ?? defaults.showAnnotations,
+    toolsHidden: state?.toolsHidden ?? defaults.toolsHidden,
+    drawColor: state?.drawColor ?? defaults.drawColor,
+    shapeColor: state?.shapeColor ?? defaults.shapeColor,
+    shapeWidthCells: Math.max(0.5, state?.shapeWidthCells ?? defaults.shapeWidthCells),
+    shapeHeightCells: Math.max(0.5, state?.shapeHeightCells ?? defaults.shapeHeightCells),
+    shapeFitToGrid: state?.shapeFitToGrid ?? defaults.shapeFitToGrid,
+  }
+}
+
+const serializableBattleMap = (battleMap: BattleMap): Omit<BattleMap, 'imageUrl'> => ({
+  imageName: battleMap.imageName,
+  width: battleMap.width,
+  height: battleMap.height,
+  calibration: {
+    ...battleMap.calibration,
+  },
+})
+
+const normalizeImportedBattleMap = (battleMap: Partial<BattleMap> | undefined): Omit<BattleMap, 'imageUrl'> => ({
+  imageName: battleMap?.imageName,
+  width: Math.max(1, battleMap?.width ?? defaultMap.width),
+  height: Math.max(1, battleMap?.height ?? defaultMap.height),
+  calibration: {
+    ...defaultMap.calibration,
+    ...(battleMap?.calibration ?? {}),
+  },
+})
+
+const blobToDataUrl = (blob: Blob) =>
+  new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(blob)
+  })
+
+const dataUrlToBlob = async (dataUrl: string) => {
+  const response = await fetch(dataUrl)
+  return response.blob()
+}
+
+const readMapImageForEncounter = async (battleMap: BattleMap): Promise<EncounterMapImage | undefined> => {
+  if (!battleMap.imageName && !battleMap.imageUrl) {
+    return undefined
+  }
+
+  let persistedImage: PersistedMapImage | undefined
+  try {
+    persistedImage = await readCache<PersistedMapImage>(mapImageCacheKey)
+  } catch {
+    persistedImage = undefined
+  }
+
+  let blob = persistedImage?.blob
+  if (!blob && battleMap.imageUrl) {
+    const response = await fetch(battleMap.imageUrl)
+    blob = await response.blob()
+  }
+
+  if (!blob) {
+    return undefined
+  }
+
+  return {
+    dataUrl: await blobToDataUrl(blob),
+    name: persistedImage?.name ?? battleMap.imageName ?? 'battle-map',
+    type: (persistedImage?.type ?? blob.type) || 'application/octet-stream',
+    size: persistedImage?.size ?? blob.size,
+    lastModified: persistedImage?.lastModified ?? Date.now(),
+    width: persistedImage?.width ?? battleMap.width,
+    height: persistedImage?.height ?? battleMap.height,
+  }
+}
+
+const downloadJsonFile = (fileName: string, payload: unknown) => {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  document.body.append(link)
+  link.click()
+  link.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
+const isEncounterSaveFile = (payload: Partial<EncounterSaveFile>): payload is EncounterSaveFile =>
+  payload.schema === encounterFileSchema &&
+  payload.version === 1 &&
+  Boolean(payload.state?.battle) &&
+  Boolean(payload.state?.battleMap) &&
+  Boolean(payload.state?.tacticalMap) &&
+  Boolean(payload.state?.ui) &&
+  Array.isArray(payload.state?.library)
+
+const encounterFileName = () => `battle-simulator-5e-encounter-${new Date().toISOString().slice(0, 10)}.json`
+
+const validPage = (page: unknown): page is AppPage =>
+  page === 'battlefield' || page === 'combatants' || page === 'library'
+
+const validLibraryTab = (tab: unknown): tab is LibraryTab =>
+  tab === 'library' || tab === 'custom' || tab === 'character' || tab === 'json'
+
+const validInspectorTab = (tab: unknown): tab is InspectorTab =>
+  tab === 'actions' || tab === 'details' || tab === 'conditions' || tab === 'effects'
+
 function App() {
   const [library, setLibrary] = useState<ContentEntry[]>(() =>
     mergeLibrary(readJsonState(libraryKey, sampleContent), sampleContent),
@@ -1283,6 +1464,9 @@ function App() {
     normalizeBattleState(readJsonState(battleKey, createDemoBattle())),
   )
   const [battleMap, setBattleMap] = useState<BattleMap>(() => readInitialBattleMap())
+  const [tacticalMapState, setTacticalMapState] = useState<TacticalMapState>(() =>
+    normalizeTacticalMapState(readJsonState(tacticalMapKey, createDefaultTacticalMapState())),
+  )
   const [draft, setDraft] = useState<DraftContent>(() => createDraft())
   const [srdCharacter, setSrdCharacter] = useState<SrdCharacterDraft>(() => createSrdCharacterDraft())
   const [srdCharacterBuilder, setSrdCharacterBuilder] = useState<SrdCharacterBuilderState>(() =>
@@ -1292,9 +1476,11 @@ function App() {
   const [srdQuery, setSrdQuery] = useState('goblin')
   const [srdStatus, setSrdStatus] = useState('SRD index not loaded')
   const [jsonImport, setJsonImport] = useState('')
+  const [encounterName, setEncounterName] = useState(() => readJsonState(encounterNameKey, defaultEncounterName))
   const [activeLibraryTab, setActiveLibraryTab] = useState<LibraryTab>('library')
   const [activePage, setActivePage] = useState<AppPage>('battlefield')
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('actions')
+  const encounterFileInputRef = useRef<HTMLInputElement | null>(null)
   const autoLoadedSrd = useRef(false)
   const restoredMapUrl = useRef<string | undefined>(undefined)
 
@@ -1310,6 +1496,14 @@ function App() {
     const persistableMap = { ...battleMap, imageUrl: undefined }
     writeJsonState(mapKey, persistableMap)
   }, [battleMap])
+
+  useEffect(() => {
+    writeJsonState(tacticalMapKey, tacticalMapState)
+  }, [tacticalMapState])
+
+  useEffect(() => {
+    writeJsonState(encounterNameKey, encounterName)
+  }, [encounterName])
 
   useEffect(() => {
     let cancelled = false
@@ -1799,18 +1993,128 @@ function App() {
   }
 
   const exportLibrary = () => {
-    const blob = new Blob([JSON.stringify(library, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = 'battle-simulator-5e-content.json'
-    link.click()
-    URL.revokeObjectURL(url)
+    downloadJsonFile('battle-simulator-5e-content.json', library)
+  }
+
+  const exportEncounter = async () => {
+    try {
+      const mapImage = await readMapImageForEncounter(battleMap)
+      const encounter: EncounterSaveFile = {
+        schema: encounterFileSchema,
+        version: 1,
+        savedAt: new Date().toISOString(),
+        state: {
+          library,
+          battle,
+          battleMap: serializableBattleMap(battleMap),
+          mapImage,
+          tacticalMap: tacticalMapState,
+          ui: {
+          activePage,
+          activeLibraryTab,
+          inspectorTab,
+          encounterName,
+          srdQuery,
+          draft,
+          srdCharacter,
+          },
+        },
+      }
+
+      downloadJsonFile(encounterFileName(), encounter)
+    } catch (error) {
+      setJsonImport(error instanceof Error ? error.message : 'Unable to save encounter file.')
+      setActiveLibraryTab('json')
+      setActivePage('library')
+    }
+  }
+
+  const importEncounterFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+
+    if (!file) {
+      return
+    }
+
+    try {
+      const parsed = JSON.parse(await file.text()) as Partial<EncounterSaveFile>
+      if (!isEncounterSaveFile(parsed)) {
+        throw new Error('Invalid encounter file. Use a Battle Simulator 5e encounter export.')
+      }
+
+      const importedMap = normalizeImportedBattleMap(parsed.state.battleMap)
+      let nextMap: BattleMap = {
+        ...importedMap,
+        imageUrl: undefined,
+      }
+
+      if (parsed.state.mapImage?.dataUrl) {
+        const imageBlob = await dataUrlToBlob(parsed.state.mapImage.dataUrl)
+        const cachedImage: PersistedMapImage = {
+          blob: imageBlob,
+          name: parsed.state.mapImage.name,
+          type: parsed.state.mapImage.type,
+          size: parsed.state.mapImage.size,
+          lastModified: parsed.state.mapImage.lastModified,
+          width: parsed.state.mapImage.width ?? importedMap.width,
+          height: parsed.state.mapImage.height ?? importedMap.height,
+        }
+        await writeCache<PersistedMapImage>(mapImageCacheKey, cachedImage)
+
+        if (restoredMapUrl.current) {
+          URL.revokeObjectURL(restoredMapUrl.current)
+        }
+
+        const imageUrl = URL.createObjectURL(imageBlob)
+        restoredMapUrl.current = imageUrl
+        nextMap = {
+          ...nextMap,
+          imageUrl,
+          imageName: cachedImage.name,
+          width: cachedImage.width ?? nextMap.width,
+          height: cachedImage.height ?? nextMap.height,
+        }
+      } else {
+        await deleteCache(mapImageCacheKey)
+        nextMap = {
+          ...nextMap,
+          imageName: undefined,
+        }
+      }
+
+      setLibrary(parsed.state.library)
+      setBattle(normalizeBattleState(parsed.state.battle))
+      setBattleMap(nextMap)
+      setTacticalMapState(normalizeTacticalMapState(parsed.state.tacticalMap))
+      setEncounterName(parsed.state.ui.encounterName?.trim() || defaultEncounterName)
+      setDraft(parsed.state.ui.draft ?? createDraft())
+      setSrdCharacter(parsed.state.ui.srdCharacter ?? createSrdCharacterDraft())
+      setSrdQuery(parsed.state.ui.srdQuery ?? 'goblin')
+      setInspectorTab(validInspectorTab(parsed.state.ui.inspectorTab) ? parsed.state.ui.inspectorTab : 'details')
+      setActiveLibraryTab(validLibraryTab(parsed.state.ui.activeLibraryTab) ? parsed.state.ui.activeLibraryTab : 'library')
+      setActivePage(validPage(parsed.state.ui.activePage) ? parsed.state.ui.activePage : 'battlefield')
+      setJsonImport(`Loaded encounter from ${file.name}`)
+    } catch (error) {
+      setJsonImport(error instanceof Error ? error.message : 'Unable to load encounter file.')
+      setActiveLibraryTab('json')
+      setActivePage('library')
+    }
   }
 
   const resetWorkspace = () => {
     setBattle((current) => longRestBattle(current))
   }
+
+  const renameEncounter = () => {
+    const nextName = window.prompt('Rename encounter', encounterName)?.trim()
+    if (!nextName) {
+      return
+    }
+
+    setEncounterName(nextName)
+  }
+
   const libraryPanel = (
     <LibraryPanel
       activeTab={activeLibraryTab}
@@ -1842,6 +2146,8 @@ function App() {
       onJsonChange={setJsonImport}
       onImportJson={importJsonContent}
       onExportLibrary={exportLibrary}
+      onImportEncounterFile={importEncounterFile}
+      onExportEncounter={exportEncounter}
     />
   )
 
@@ -1860,7 +2166,7 @@ function App() {
           </div>
           <div>
             <h1>Battle Simulator 5e</h1>
-            <p>Ruined Watchtower encounter desk</p>
+            <p>{encounterName} encounter desk</p>
           </div>
         </div>
 
@@ -1904,7 +2210,18 @@ function App() {
             <UserPlus size={17} />
             Manual Entry
           </button>
-          <button type="button" onClick={exportLibrary}>
+          <button type="button" onClick={() => encounterFileInputRef.current?.click()}>
+            <Upload size={17} />
+            Load Encounter
+          </button>
+          <input
+            ref={encounterFileInputRef}
+            type="file"
+            accept="application/json,.json"
+            onChange={importEncounterFile}
+            style={{ display: 'none' }}
+          />
+          <button type="button" onClick={() => void exportEncounter()}>
             <Save size={17} />
             Save Encounter
           </button>
@@ -1933,12 +2250,6 @@ function App() {
           <button type="button" className="icon-button ghost" onClick={resetWorkspace} aria-label="Long rest reset">
             <RotateCcw size={18} />
           </button>
-          <button type="button" className="icon-button ghost" aria-label="Pause automation">
-            <Pause size={18} />
-          </button>
-          <button type="button" className="icon-button ghost" aria-label="Encounter settings">
-            <Settings size={18} />
-          </button>
         </div>
       </header>
 
@@ -1954,9 +2265,11 @@ function App() {
         <div className="workspace-grid battlefield-grid">
           <aside className="panel left-rail">
             <Roster
+              encounterName={encounterName}
               combatants={battle.combatants}
               selectedId={battle.selectedCombatantId}
               onSelect={selectCombatantSheet}
+              onRenameEncounter={renameEncounter}
             />
           </aside>
 
@@ -1964,6 +2277,8 @@ function App() {
             <TacticalMap
               battleMap={battleMap}
               setBattleMap={setBattleMap}
+              tacticalMapState={tacticalMapState}
+              setTacticalMapState={setTacticalMapState}
               combatants={battle.combatants}
               selectedCombatantId={battle.selectedCombatantId}
               onSelectCombatant={selectCombatantSheet}
@@ -2016,9 +2331,11 @@ function App() {
           <section className="panel library-page-main">{libraryPanel}</section>
           <aside className="panel library-page-side">
             <Roster
+              encounterName={encounterName}
               combatants={battle.combatants}
               selectedId={battle.selectedCombatantId}
               onSelect={selectCombatantSheet}
+              onRenameEncounter={renameEncounter}
             />
           </aside>
         </div>
@@ -2306,6 +2623,8 @@ function LibraryPanel({
   onJsonChange,
   onImportJson,
   onExportLibrary,
+  onImportEncounterFile,
+  onExportEncounter,
 }: {
   activeTab: LibraryTab
   setActiveTab: (tab: LibraryTab) => void
@@ -2336,6 +2655,8 @@ function LibraryPanel({
   onJsonChange: (value: string) => void
   onImportJson: () => void
   onExportLibrary: () => void
+  onImportEncounterFile: (event: ChangeEvent<HTMLInputElement>) => void
+  onExportEncounter: () => Promise<void>
 }) {
   return (
     <div className="library-panel">
@@ -2442,11 +2763,20 @@ function LibraryPanel({
           <div className="tool-row">
             <button type="button" onClick={onImportJson}>
               <FileJson size={16} />
-              Import JSON
+              Import content JSON
             </button>
             <button type="button" onClick={onExportLibrary}>
               <Download size={16} />
               Export library
+            </button>
+            <label className="upload-button">
+              <Upload size={16} />
+              Load encounter
+              <input type="file" accept="application/json,.json" onChange={onImportEncounterFile} />
+            </label>
+            <button type="button" onClick={() => void onExportEncounter()}>
+              <Save size={16} />
+              Save encounter
             </button>
           </div>
         </div>
@@ -3208,6 +3538,8 @@ function CustomBuilder({
 function TacticalMap({
   battleMap,
   setBattleMap,
+  tacticalMapState,
+  setTacticalMapState,
   combatants,
   selectedCombatantId,
   onSelectCombatant,
@@ -3215,6 +3547,8 @@ function TacticalMap({
 }: {
   battleMap: BattleMap
   setBattleMap: React.Dispatch<React.SetStateAction<BattleMap>>
+  tacticalMapState: TacticalMapState
+  setTacticalMapState: React.Dispatch<React.SetStateAction<TacticalMapState>>
   combatants: Combatant[]
   selectedCombatantId?: string
   onSelectCombatant: (id: string) => void
@@ -3240,16 +3574,74 @@ function TacticalMap({
     | undefined
   >(undefined)
   const [mapImage, setMapImage] = useState<HTMLImageElement | null>(null)
-  const [activeMapTool, setActiveMapTool] = useState<MapTool>('mouse')
-  const [mapView, setMapView] = useState<MapView>({ zoom: 1, panX: 0, panY: 0 })
-  const [measurement, setMeasurement] = useState<{ from: GridPoint; to?: GridPoint }>()
-  const [annotations, setAnnotations] = useState<MapAnnotation[]>([])
-  const [showAnnotations, setShowAnnotations] = useState(true)
-  const [drawColor, setDrawColor] = useState('#f0c37b')
-  const [shapeColor, setShapeColor] = useState('#7db9ff')
-  const [shapeWidthCells, setShapeWidthCells] = useState(3)
-  const [shapeHeightCells, setShapeHeightCells] = useState(3)
-  const [shapeFitToGrid, setShapeFitToGrid] = useState(true)
+  const {
+    activeMapTool,
+    mapView,
+    measurement,
+    annotations,
+    showAnnotations,
+    toolsHidden,
+    drawColor,
+    shapeColor,
+    shapeWidthCells,
+    shapeHeightCells,
+    shapeFitToGrid,
+  } = tacticalMapState
+  const setActiveMapTool = (next: React.SetStateAction<MapTool>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      activeMapTool: resolveStateUpdate(next, current.activeMapTool),
+    }))
+  const setMapView = (next: React.SetStateAction<MapView>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      mapView: resolveStateUpdate(next, current.mapView),
+    }))
+  const setMeasurement = (next: React.SetStateAction<TacticalMapState['measurement']>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      measurement: resolveStateUpdate(next, current.measurement),
+    }))
+  const setAnnotations = (next: React.SetStateAction<MapAnnotation[]>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      annotations: resolveStateUpdate(next, current.annotations),
+    }))
+  const setShowAnnotations = (next: React.SetStateAction<boolean>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      showAnnotations: resolveStateUpdate(next, current.showAnnotations),
+    }))
+  const setToolsHidden = (next: React.SetStateAction<boolean>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      toolsHidden: resolveStateUpdate(next, current.toolsHidden),
+    }))
+  const setDrawColor = (next: React.SetStateAction<string>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      drawColor: resolveStateUpdate(next, current.drawColor),
+    }))
+  const setShapeColor = (next: React.SetStateAction<string>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      shapeColor: resolveStateUpdate(next, current.shapeColor),
+    }))
+  const setShapeWidthCells = (next: React.SetStateAction<number>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      shapeWidthCells: resolveStateUpdate(next, current.shapeWidthCells),
+    }))
+  const setShapeHeightCells = (next: React.SetStateAction<number>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      shapeHeightCells: resolveStateUpdate(next, current.shapeHeightCells),
+    }))
+  const setShapeFitToGrid = (next: React.SetStateAction<boolean>) =>
+    setTacticalMapState((current) => ({
+      ...current,
+      shapeFitToGrid: resolveStateUpdate(next, current.shapeFitToGrid),
+    }))
   const [isDetectingGrid, setIsDetectingGrid] = useState(false)
   const [gridDetectionStatus, setGridDetectionStatus] = useState('')
   const selectedCombatant = combatants.find((combatant) => combatant.id === selectedCombatantId)
@@ -3321,7 +3713,10 @@ function TacticalMap({
       }
 
       const gestureEvent = event as GestureLikeEvent
-      setMapView(zoomViewAtPoint(gestureStartView, gestureStartView.zoom * (gestureEvent.scale ?? 1), gestureAnchor))
+      setTacticalMapState((current) => ({
+        ...current,
+        mapView: zoomViewAtPoint(gestureStartView, gestureStartView.zoom * (gestureEvent.scale ?? 1), gestureAnchor),
+      }))
     }
 
     const handleGestureEnd = (event: Event) => {
@@ -3340,7 +3735,10 @@ function TacticalMap({
       const anchor = pointFromClient(event.clientX, event.clientY)
       const delta = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY
 
-      setMapView((current) => zoomViewAtPoint(current, current.zoom * Math.exp(-delta * 0.0025), anchor))
+      setTacticalMapState((current) => ({
+        ...current,
+        mapView: zoomViewAtPoint(current.mapView, current.mapView.zoom * Math.exp(-delta * 0.0025), anchor),
+      }))
     }
 
     mapWindow.addEventListener('wheel', handleNativeWheel, wheelOptions)
@@ -3354,7 +3752,7 @@ function TacticalMap({
       mapWindow.removeEventListener('gesturechange', handleGestureChange)
       mapWindow.removeEventListener('gestureend', handleGestureEnd)
     }
-  }, [])
+  }, [setTacticalMapState])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -3807,11 +4205,22 @@ function TacticalMap({
             <Wand2 size={16} />
             {isDetectingGrid ? 'Detecting...' : 'Detect grid'}
           </button>
+          <button
+            type="button"
+            className={toolsHidden ? '' : 'selected'}
+            onClick={() => setToolsHidden((current) => !current)}
+            aria-pressed={!toolsHidden}
+            aria-label={toolsHidden ? 'Show map tools' : 'Hide map tools'}
+            title={toolsHidden ? 'Show map tools' : 'Hide map tools'}
+          >
+            <Settings size={16} />
+            Tools
+          </button>
           {gridDetectionStatus ? <span className="grid-detect-status">{gridDetectionStatus}</span> : null}
         </div>
       </div>
 
-      <div ref={mapWindowRef} className={`canvas-wrap${battleMap.imageUrl ? ' has-native-map' : ''}`}>
+      {!toolsHidden ? (
         <div className="map-tool-palette" aria-label="Map tools">
           <button type="button" aria-label="Zoom in" title="Zoom in" onClick={() => zoomMap(1.25)}>
             <ZoomIn size={18} />
@@ -3842,7 +4251,8 @@ function TacticalMap({
             </button>
           ))}
         </div>
-        {activeMapTool === 'draw' ? (
+      ) : null}
+      {!toolsHidden && activeMapTool === 'draw' ? (
           <div className="map-tool-options">
             <label>
               <span>Ink</span>
@@ -3850,7 +4260,7 @@ function TacticalMap({
             </label>
           </div>
         ) : null}
-        {activeMapTool === 'square' || activeMapTool === 'circle' ? (
+      {!toolsHidden && (activeMapTool === 'square' || activeMapTool === 'circle') ? (
           <div className="map-tool-options">
             <label>
               <span>Color</span>
@@ -3882,6 +4292,8 @@ function TacticalMap({
             </label>
           </div>
         ) : null}
+
+      <div ref={mapWindowRef} className={`canvas-wrap${battleMap.imageUrl ? ' has-native-map' : ''}`}>
         <canvas
           ref={canvasRef}
           className={`battle-canvas tool-${activeMapTool}${battleMap.imageUrl ? ' battle-canvas--native-image' : ''}`}
@@ -4371,13 +4783,17 @@ function CalibrationInput({
 }
 
 function Roster({
+  encounterName,
   combatants,
   selectedId,
   onSelect,
+  onRenameEncounter,
 }: {
+  encounterName: string
   combatants: Combatant[]
   selectedId?: string
   onSelect: (id: string) => void
+  onRenameEncounter: () => void
 }) {
   const heroCount = combatants.filter((combatant) => combatant.side === 'Heroes').length
   const monsterCount = combatants.filter((combatant) => combatant.side === 'Monsters').length
@@ -4388,9 +4804,15 @@ function Roster({
         <div className="encounter-title">
           <div>
             <span>Encounter</span>
-            <strong>Ruined Watchtower</strong>
+            <strong>{encounterName}</strong>
           </div>
-          <button type="button" className="icon-button ghost" aria-label="Encounter menu">
+          <button
+            type="button"
+            className="icon-button ghost"
+            onClick={onRenameEncounter}
+            aria-label="Rename encounter"
+            title="Rename encounter"
+          >
             <MoreVertical size={17} />
           </button>
         </div>

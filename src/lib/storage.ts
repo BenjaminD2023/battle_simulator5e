@@ -43,6 +43,19 @@ export const writeCache = async <T>(key: string, value: T): Promise<void> => {
   })
 }
 
+export const deleteCache = async (key: string): Promise<void> => {
+  const database = await openDatabase()
+
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(STORE_NAME)
+    const request = store.delete(key)
+
+    request.onsuccess = () => resolve()
+    request.onerror = () => reject(request.error)
+  })
+}
+
 export const readJsonState = <T>(key: string, fallback: T): T => {
   try {
     const stored = localStorage.getItem(key)

@@ -1896,6 +1896,14 @@ meter::-webkit-meter-optimum-value {
   font-weight: 850;
 }
 
+.map-toolbar button.selected {
+  border-color: rgba(104, 186, 82, 0.62);
+  color: #ffffff;
+  background:
+    linear-gradient(180deg, rgba(74, 133, 59, 0.34), rgba(30, 60, 25, 0.32)),
+    #132110;
+}
+
 .grid-detect-status {
   display: inline-flex;
   align-items: center;
@@ -3575,5 +3583,413 @@ button,
     height: 36px;
     padding: 0 10px;
     font-size: 12px;
+  }
+}
+
+/* Responsive scrolling pass: keep every major surface reachable on short or narrow screens. */
+html,
+body,
+#root {
+  min-width: 0;
+  min-height: 100dvh;
+}
+
+body {
+  overflow-x: hidden;
+}
+
+.app-shell,
+.top-bar,
+.workspace-grid,
+.library-page,
+.management-page,
+.left-rail,
+.right-rail,
+.center-stage,
+.battle-bottom-dock,
+.round-controls,
+.inspector,
+.library-panel,
+.management-list,
+.action-catalog,
+.management-inspector {
+  min-width: 0;
+}
+
+.page-nav,
+.top-actions,
+.round-stepper,
+.initiative-strip,
+.round-timeline {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(205, 176, 125, 0.5) rgba(255, 255, 255, 0.04);
+}
+
+.page-nav {
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+}
+
+.top-actions {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.workspace-grid.battlefield-grid {
+  height: auto;
+  min-height: calc(100dvh - 72px);
+  align-items: stretch;
+  overflow: visible;
+}
+
+.battlefield-grid .left-rail,
+.battlefield-grid .right-rail,
+.battlefield-grid .center-stage {
+  height: auto;
+  min-height: 0;
+  max-height: none;
+}
+
+.battlefield-grid .left-rail,
+.battlefield-grid .right-rail {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.battlefield-grid .center-stage {
+  grid-template-rows: minmax(420px, min(68dvh, 760px)) auto;
+  overflow: visible;
+}
+
+.map-panel {
+  height: clamp(420px, calc(100dvh - 340px), 760px);
+  min-height: 0;
+}
+
+.canvas-wrap {
+  min-width: 0;
+  min-height: 0;
+}
+
+.battle-bottom-dock {
+  height: auto;
+  min-height: 0;
+  overflow: visible;
+}
+
+.combat-log,
+.round-controls {
+  height: auto;
+  min-height: 0;
+}
+
+.combat-log {
+  overflow: auto;
+}
+
+.round-controls {
+  grid-template-rows: auto auto auto;
+  overflow: visible;
+}
+
+.dice-command-deck {
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: visible;
+}
+
+.library-page,
+.management-page {
+  height: auto;
+  min-height: calc(100dvh - 72px);
+  align-items: stretch;
+  overflow: visible;
+}
+
+.library-page-main,
+.library-page-side,
+.management-list,
+.action-catalog,
+.management-inspector {
+  min-width: 0;
+  max-height: none;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.sheet-roll-table,
+.planned-action-panel,
+.roll-adjustment-panel,
+.status-editor-panel,
+.configured-action-card,
+.json-tools {
+  min-width: 0;
+}
+
+.sheet-roll-table {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.sheet-roll-header,
+.sheet-roll-row {
+  min-width: 520px;
+}
+
+.content-card,
+.combatant-card,
+.action-row,
+.action-card,
+.planned-action-row,
+.status-card,
+.status-add-panel {
+  min-width: 0;
+}
+
+@media (min-width: 1321px) and (min-height: 820px) {
+  .workspace-grid.battlefield-grid {
+    height: calc(100dvh - 72px);
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .battlefield-grid .left-rail,
+  .battlefield-grid .right-rail,
+  .battlefield-grid .center-stage {
+    height: calc(100dvh - 72px);
+  }
+
+  .battlefield-grid .center-stage {
+    grid-template-rows: minmax(480px, 1fr) 260px;
+    overflow: hidden;
+  }
+
+  .map-panel {
+    height: 100%;
+  }
+
+  .battle-bottom-dock,
+  .round-controls {
+    overflow: hidden;
+  }
+
+  .library-page,
+  .management-page {
+    height: calc(100dvh - 72px);
+    min-height: 0;
+    overflow: hidden;
+  }
+}
+
+@media (max-width: 1320px) {
+  .workspace-grid.battlefield-grid,
+  .library-page,
+  .management-page {
+    min-height: calc(100dvh - 124px);
+  }
+
+  .battlefield-grid .center-stage {
+    grid-template-rows: minmax(420px, 62dvh) auto;
+  }
+
+  .map-panel {
+    height: clamp(420px, 62dvh, 680px);
+  }
+}
+
+@media (max-width: 1180px) {
+  .battlefield-grid .left-rail,
+  .battlefield-grid .right-rail {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .battle-bottom-dock {
+    grid-template-columns: 1fr;
+  }
+
+  .dice-command-deck {
+    overflow-x: auto;
+  }
+
+  .library-page-main,
+  .library-page-side,
+  .management-list,
+  .action-catalog,
+  .management-inspector {
+    overflow: visible;
+  }
+}
+
+@media (max-width: 820px) {
+  body {
+    overflow-x: hidden;
+  }
+
+  .top-bar {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .round-stepper,
+  .top-actions {
+    width: 100%;
+  }
+
+  .top-actions {
+    justify-content: flex-start;
+    padding: 8px 10px;
+  }
+
+  .workspace-grid.battlefield-grid,
+  .library-page,
+  .management-page {
+    min-height: 0;
+  }
+
+  .battlefield-grid .center-stage {
+    grid-template-rows: minmax(360px, 72svh) auto;
+  }
+
+  .map-panel {
+    height: clamp(360px, 72svh, 560px);
+  }
+
+  .map-toolbar {
+    max-height: calc(100% - 16px);
+    overflow: auto;
+  }
+
+  .map-tool-palette {
+    max-height: calc(100% - 24px);
+    overflow-y: auto;
+  }
+
+  .battle-bottom-dock,
+  .combat-log,
+  .round-controls,
+  .dice-command-deck {
+    overflow: visible;
+  }
+
+  .log-list {
+    max-height: 260px;
+  }
+
+  .library-page,
+  .management-page {
+    grid-template-columns: 1fr;
+  }
+
+  .library-panel,
+  .management-list,
+  .action-catalog,
+  .management-inspector,
+  .inspector {
+    padding: 14px;
+  }
+}
+
+@media (max-width: 560px) {
+  .brand-lockup {
+    min-width: 0;
+  }
+
+  .brand-lockup h1 {
+    font-size: 17px;
+  }
+
+  .page-nav button {
+    min-width: 136px;
+  }
+
+  .round-stepper strong {
+    min-width: 88px;
+    font-size: 15px;
+  }
+
+  .map-toolbar {
+    right: 6px;
+    left: 58px;
+  }
+
+  .map-toolbar .tool-row {
+    justify-content: flex-start;
+    overflow-x: auto;
+  }
+
+  .map-tool-options {
+    right: 8px;
+    left: 58px;
+    max-width: none;
+    overflow: auto;
+  }
+
+  .initiative-strip .turn-chip {
+    flex-basis: 100%;
+    max-width: none;
+  }
+
+  .round-button-row {
+    grid-template-columns: 1fr;
+  }
+
+  .content-card,
+  .combatant-card,
+  .action-row {
+    grid-template-columns: 1fr;
+  }
+
+  .card-actions {
+    justify-content: stretch;
+  }
+
+  .card-actions button {
+    flex: 1 1 0;
+  }
+
+  .search-box {
+    grid-template-columns: 44px minmax(0, 1fr);
+    height: 48px;
+    min-height: 48px;
+  }
+
+  .search-box input {
+    height: 44px;
+    min-height: 44px;
+    font-size: 18px;
+  }
+}
+
+@media (max-height: 760px) {
+  .workspace-grid.battlefield-grid {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .battlefield-grid .left-rail,
+  .battlefield-grid .right-rail,
+  .battlefield-grid .center-stage {
+    height: auto;
+  }
+
+  .battlefield-grid .center-stage {
+    grid-template-rows: minmax(340px, 58dvh) auto;
+  }
+
+  .map-panel {
+    height: clamp(340px, 58dvh, 520px);
+  }
+
+  .battle-bottom-dock,
+  .round-controls,
+  .dice-command-deck {
+    overflow: visible;
+  }
+
+  .log-list {
+    max-height: 220px;
   }
 }
