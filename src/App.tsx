@@ -92,6 +92,7 @@ import type {
   GridCalibration,
   GridPoint,
   PlannedActionIntent,
+  ResourceDefinition,
   RollBonusConfig,
   RollProfileKey,
   RollAdjustment,
@@ -484,6 +485,243 @@ const splitList = (value: string) =>
     .split(',')
     .map((entry) => entry.trim())
     .filter(Boolean)
+
+const abilityKeys = ['str', 'dex', 'con', 'int', 'wis', 'cha'] as const
+const actionKinds = ['attack', 'save', 'heal', 'manual'] as const
+const contentKinds = ['monster', 'player'] as const
+const damageOnSaveOptions = ['none', 'half'] as const
+const recoveryKinds = ['round', 'shortRest', 'longRest', 'manual'] as const
+const sourceKinds = ['SRD', 'Custom', 'Third-party', 'Imported', 'Draft'] as const
+const targetKinds = ['enemy', 'ally', 'self', 'area', 'manual'] as const
+
+const slugify = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+
+const asRecord = (value: unknown) =>
+  value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
+
+const isEnumValue = <T extends string>(value: unknown, options: readonly T[]): value is T =>
+  typeof value === 'string' && (options as readonly string[]).includes(value)
+
+const enumValue = <T extends string>(value: unknown, options: readonly T[], fallback: T): T =>
+  isEnumValue(value, options) ? value : fallback
+
+const optionalEnumValue = <T extends string>(value: unknown, options: readonly T[]): T | undefined =>
+  isEnumValue(value, options) ? value : undefined
+
+const numberField = (value: unknown, fallback: number) => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+const optionalNumberField = (value: unknown) => {
+  if (value === undefined || value === null || value === '') {
+    return undefined
+  }
+
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+const stringField = (value: unknown, fallback: string) => (typeof value === 'string' && value.trim() ? value.trim() : fallback)
+
+const stringListField = (value: unknown) => {
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry).trim()).filter(Boolean)
+  }
+
+  return typeof value === 'string' ? splitList(value) : []
+}
+
+const abilityListField = (value: unknown) =>
+  stringListField(value).filter((entry): entry is Ability => abilityKeys.includes(entry as Ability))
+
+const normalizeImportedEffects = (value: unknown): EffectDefinition[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined
+  }
+
+  const effects = value
+    .map((effect, index) => {
+      const candidate = asRecord(effect)
+      if (!candidate) {
+        return undefined
+      }
+
+      return {
+        id: stringField(candidate.id, `imported-effect-${index}`),
+        label: stringField(candidate.label, 'Effect'),
+        description: stringField(candidate.description, ''),
+      }
+    })
+    .filter((effect): effect is EffectDefinition => Boolean(effect))
+
+  return effects.length ? effects : undefined
+}
+
+const normalizeImportedAction = (value: unknown, index: number): ActionDefinition | undefined => {
+  const candidate = asRecord(value)
+  if (!candidate) {
+    return undefined
+  }
+
+  const name = stringField(candidate.name, `Imported Action ${index + 1}`)
+  const kind = enumValue(candidate.kind, actionKinds, 'manual')
+  const target = enumValue(candidate.target, targetKinds, kind === 'heal' ? 'ally' : kind === 'manual' ? 'manual' : 'enemy')
+
+  return {
+    id: stringField(candidate.id, slugify(name) || `imported-action-${index}`),
+    name,
+    kind,
+    attackBonus: kind === 'attack' ? numberField(candidate.attackBonus, 0) : optionalNumberField(candidate.attackBonus),
+    damageDice: typeof candidate.damageDice === 'string' ? candidate.damageDice : kind === 'heal' ? undefined : '0',
+    damageType: typeof candidate.damageType === 'string' ? candidate.damageType : undefined,
+    healingDice: typeof candidate.healingDice === 'string' ? candidate.healingDice : kind === 'heal' ? '1d4' : undefined,
+    rangeFt: optionalNumberField(candidate.rangeFt),
+    reachFt: optionalNumberField(candidate.reachFt),
+    saveDc: kind === 'save' ? numberField(candidate.saveDc, 10) : optionalNumberField(candidate.saveDc),
+    saveAbility: optionalEnumValue(candidate.saveAbility, abilityKeys),
+    damageOnSave: optionalEnumValue(candidate.damageOnSave, damageOnSaveOptions),
+    target,
+    tags: stringListField(candidate.tags),
+    description: typeof candidate.description === 'string' ? candidate.description : undefined,
+    effects: normalizeImportedEffects(candidate.effects),
+  }
+}
+
+const normalizeImportedResource = (value: unknown, index: number): ResourceDefinition | undefined => {
+  const candidate = asRecord(value)
+  if (!candidate) {
+    return undefined
+  }
+
+  const label = stringField(candidate.label, `Resource ${index + 1}`)
+  const max = Math.max(0, numberField(candidate.max, 0))
+
+  return {
+    id: stringField(candidate.id, slugify(label) || `imported-resource-${index}`),
+    label,
+    max,
+    current: Math.max(0, numberField(candidate.current, max)),
+    recovery: enumValue(candidate.recovery, recoveryKinds, 'manual'),
+  }
+}
+
+const normalizeImportedContentEntry = (value: unknown, index: number): ContentEntry | undefined => {
+  const candidate = asRecord(value)
+  if (!candidate) {
+    return undefined
+  }
+
+  const name = stringField(candidate.name, `Imported Entry ${index + 1}`)
+  const source = asRecord(candidate.source)
+  const abilitySource = asRecord(candidate.abilityScores) ?? {}
+  const actions = Array.isArray(candidate.actions)
+    ? candidate.actions
+        .map((action, actionIndex) => normalizeImportedAction(action, actionIndex))
+        .filter((action): action is ActionDefinition => Boolean(action))
+    : []
+
+  return {
+    id: stringField(candidate.id, `imported-${slugify(name) || 'entry'}-${Date.now()}-${index}`),
+    name,
+    kind: enumValue(candidate.kind, contentKinds, 'monster'),
+    source: {
+      kind: enumValue(source?.kind, sourceKinds, 'Imported'),
+      book: typeof source?.book === 'string' ? source.book : 'Manual JSON import',
+      apiIndex: typeof source?.apiIndex === 'string' ? source.apiIndex : undefined,
+      apiUrl: typeof source?.apiUrl === 'string' ? source.apiUrl : undefined,
+      attribution: typeof source?.attribution === 'string' ? source.attribution : undefined,
+    },
+    armorClass: numberField(candidate.armorClass, 10),
+    maxHp: Math.max(1, numberField(candidate.maxHp, 1)),
+    speedFt: Math.max(0, numberField(candidate.speedFt, 30)),
+    initiativeBonus: numberField(candidate.initiativeBonus, numberField(abilitySource.dex, 10) >= 10 ? 0 : -1),
+    level: optionalNumberField(candidate.level),
+    proficiencyBonus: optionalNumberField(candidate.proficiencyBonus),
+    challenge: typeof candidate.challenge === 'string' ? candidate.challenge : undefined,
+    size: typeof candidate.size === 'string' ? candidate.size : undefined,
+    type: typeof candidate.type === 'string' ? candidate.type : undefined,
+    abilityScores: {
+      ...baseAbilityScores,
+      str: numberField(abilitySource.str, 10),
+      dex: numberField(abilitySource.dex, 10),
+      con: numberField(abilitySource.con, 10),
+      int: numberField(abilitySource.int, 10),
+      wis: numberField(abilitySource.wis, 10),
+      cha: numberField(abilitySource.cha, 10),
+    },
+    saveProficiencies: abilityListField(candidate.saveProficiencies),
+    resistances: stringListField(candidate.resistances),
+    immunities: stringListField(candidate.immunities),
+    vulnerabilities: stringListField(candidate.vulnerabilities),
+    traits: stringListField(candidate.traits),
+    resources: Array.isArray(candidate.resources)
+      ? candidate.resources
+          .map((resource, resourceIndex) => normalizeImportedResource(resource, resourceIndex))
+          .filter((resource): resource is ResourceDefinition => Boolean(resource))
+      : [],
+    actions: actions.length
+      ? actions
+      : [
+          {
+            id: 'manual-ruling',
+            name: 'Manual Ruling',
+            kind: 'manual',
+            reachFt: 5,
+            rangeFt: 30,
+            target: 'manual',
+            tags: ['manual'],
+            description: 'Imported entry did not include configured actions.',
+          },
+        ],
+    rollBonuses: asRecord(candidate.rollBonuses) as ContentEntry['rollBonuses'],
+    notes: typeof candidate.notes === 'string' ? candidate.notes : undefined,
+  }
+}
+
+const extractJsonText = (value: string) => {
+  const trimmed = value.trim()
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
+
+  return (fenced?.[1] ?? trimmed).trim()
+}
+
+const importedContentPayload = (payload: unknown) => {
+  if (Array.isArray(payload)) {
+    return payload
+  }
+
+  const candidate = asRecord(payload)
+  const state = asRecord(candidate?.state)
+
+  if (Array.isArray(candidate?.entries)) {
+    return candidate.entries
+  }
+  if (Array.isArray(candidate?.content)) {
+    return candidate.content
+  }
+  if (Array.isArray(candidate?.library)) {
+    return candidate.library
+  }
+  if (Array.isArray(state?.library)) {
+    return state.library
+  }
+
+  return payload ? [payload] : []
+}
+
+const parseImportedContentEntries = (value: string) => {
+  const parsed = JSON.parse(extractJsonText(value)) as unknown
+  const entries = importedContentPayload(parsed)
+    .map((entry, index) => normalizeImportedContentEntry(entry, index))
+    .filter((entry): entry is ContentEntry => Boolean(entry))
+
+  if (!entries.length) {
+    throw new Error('No importable content entries found.')
+  }
+
+  return entries
+}
 
 const draftActionToDefinition = (
   action: DraftAction,
@@ -1476,6 +1714,7 @@ function App() {
   const [srdQuery, setSrdQuery] = useState('goblin')
   const [srdStatus, setSrdStatus] = useState('SRD index not loaded')
   const [jsonImport, setJsonImport] = useState('')
+  const [jsonImportStatus, setJsonImportStatus] = useState('Paste content JSON, a fenced JSON block, or an exported encounter.')
   const [encounterName, setEncounterName] = useState(() => readJsonState(encounterNameKey, defaultEncounterName))
   const [activeLibraryTab, setActiveLibraryTab] = useState<LibraryTab>('library')
   const [activePage, setActivePage] = useState<AppPage>('battlefield')
@@ -1652,6 +1891,33 @@ function App() {
         ...current,
         combatants: [...current.combatants, combatant],
         selectedCombatantId: combatant.id,
+      }
+    })
+    setInspectorTab('details')
+  }
+
+  const addEntriesToBattle = (entries: ContentEntry[]) => {
+    setBattle((current) => {
+      const combatants = [...current.combatants]
+      let selectedCombatantId = current.selectedCombatantId
+
+      entries.forEach((entry) => {
+        const side: Side = entry.kind === 'player' ? 'Heroes' : 'Monsters'
+        const sideCount = combatants.filter((combatant) => combatant.side === side).length
+        const combatant = makeCombatant(
+          entry,
+          side,
+          side === 'Heroes' ? { x: 2, y: 2 + sideCount * 2 } : { x: 11, y: 2 + sideCount * 2 },
+          side === 'Heroes' ? 'manual' : 'nearest',
+        )
+        combatants.push(combatant)
+        selectedCombatantId = combatant.id
+      })
+
+      return {
+        ...current,
+        combatants,
+        selectedCombatantId,
       }
     })
     setInspectorTab('details')
@@ -1982,13 +2248,27 @@ function App() {
 
   const importJsonContent = () => {
     try {
-      const parsed = JSON.parse(jsonImport) as ContentEntry | ContentEntry[]
-      const entries = Array.isArray(parsed) ? parsed : [parsed]
+      const entries = parseImportedContentEntries(jsonImport)
       setLibrary((current) => mergeLibrary(current, entries))
       setJsonImport('')
+      setJsonImportStatus(`${entries.length} content ${entries.length === 1 ? 'entry' : 'entries'} imported to the library.`)
       setActiveLibraryTab('library')
-    } catch {
-      setJsonImport('Invalid JSON. Paste a ContentEntry or ContentEntry[] export.')
+    } catch (error) {
+      setJsonImportStatus(error instanceof Error ? error.message : 'Invalid JSON. Paste a ContentEntry or ContentEntry[] export.')
+    }
+  }
+
+  const importJsonToBattle = () => {
+    try {
+      const entries = parseImportedContentEntries(jsonImport)
+      setLibrary((current) => mergeLibrary(current, entries))
+      addEntriesToBattle(entries)
+      setJsonImport('')
+      setJsonImportStatus(`${entries.length} content ${entries.length === 1 ? 'entry' : 'entries'} imported and added to the battle.`)
+      setActiveLibraryTab('library')
+      setActivePage('battlefield')
+    } catch (error) {
+      setJsonImportStatus(error instanceof Error ? error.message : 'Invalid JSON. Paste a ContentEntry or ContentEntry[] export.')
     }
   }
 
@@ -2127,6 +2407,7 @@ function App() {
       srdCharacter={srdCharacter}
       srdCharacterBuilder={srdCharacterBuilder}
       jsonImport={jsonImport}
+      jsonImportStatus={jsonImportStatus}
       onQueryChange={setSrdQuery}
       onLoadSrd={loadSrdIndex}
       onImportSrd={importSrdMonster}
@@ -2145,6 +2426,7 @@ function App() {
       onAddSrdCharacter={addSrdCharacterToLibrary}
       onJsonChange={setJsonImport}
       onImportJson={importJsonContent}
+      onImportJsonToBattle={importJsonToBattle}
       onExportLibrary={exportLibrary}
       onImportEncounterFile={importEncounterFile}
       onExportEncounter={exportEncounter}
@@ -2604,6 +2886,7 @@ function LibraryPanel({
   srdCharacter,
   srdCharacterBuilder,
   jsonImport,
+  jsonImportStatus,
   onQueryChange,
   onLoadSrd,
   onImportSrd,
@@ -2622,6 +2905,7 @@ function LibraryPanel({
   onAddSrdCharacter,
   onJsonChange,
   onImportJson,
+  onImportJsonToBattle,
   onExportLibrary,
   onImportEncounterFile,
   onExportEncounter,
@@ -2636,6 +2920,7 @@ function LibraryPanel({
   srdCharacter: SrdCharacterDraft
   srdCharacterBuilder: SrdCharacterBuilderState
   jsonImport: string
+  jsonImportStatus: string
   onQueryChange: (query: string) => void
   onLoadSrd: () => void
   onImportSrd: (index: string, addToField?: boolean) => void
@@ -2654,6 +2939,7 @@ function LibraryPanel({
   onAddSrdCharacter: () => void
   onJsonChange: (value: string) => void
   onImportJson: () => void
+  onImportJsonToBattle: () => void
   onExportLibrary: () => void
   onImportEncounterFile: (event: ChangeEvent<HTMLInputElement>) => void
   onExportEncounter: () => Promise<void>
@@ -2758,12 +3044,22 @@ function LibraryPanel({
           <textarea
             value={jsonImport}
             onChange={(event) => onJsonChange(event.target.value)}
-            placeholder="Paste a ContentEntry or ContentEntry[] JSON export."
+            placeholder="Paste a ContentEntry, ContentEntry[], fenced JSON block, content pack, or saved encounter JSON."
           />
+          <div className="srd-import">
+            <div>
+              <strong>JSON import</strong>
+              <p>{jsonImportStatus}</p>
+            </div>
+          </div>
           <div className="tool-row">
             <button type="button" onClick={onImportJson}>
               <FileJson size={16} />
               Import content JSON
+            </button>
+            <button type="button" onClick={onImportJsonToBattle}>
+              <Swords size={16} />
+              Import to battle
             </button>
             <button type="button" onClick={onExportLibrary}>
               <Download size={16} />
