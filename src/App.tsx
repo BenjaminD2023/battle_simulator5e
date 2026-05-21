@@ -18,6 +18,7 @@ import {
   HeartPulse,
   LibraryBig,
   Map as MapIcon,
+  Minus,
   MousePointer2,
   Move,
   MoreVertical,
@@ -44,10 +45,21 @@ import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { sampleContent } from './data/sampleContent'
 import {
+  actionSupportsDamageModifier,
+  isDamageModifierAction,
+  isNoActionId,
+  noActionId,
+  noActionLabel,
+} from './lib/actions'
+import {
   autoPlanRound,
   makeCombatant,
   makeInitialBattle,
   removeDefeated,
+  getBattleTimeline,
+  getCurrentTimelineCombatantId,
+  getCurrentTimelineItem,
+  resolveCurrentTurn,
   longRestBattle,
   resolveRound,
   rollInitiative,
@@ -61,6 +73,14 @@ import {
   gridToPixel,
   pixelToGrid,
 } from './lib/grid'
+import {
+  actionResourceAvailability,
+  buildSpellSlotResources,
+  ensureResourcesForActions,
+  resourceCostLabel,
+  spellSlotResourceId,
+  spellSlotResourceLabel,
+} from './lib/resources'
 import {
   fetchSrdClass,
   fetchSrdClassIndex,
@@ -92,11 +112,15 @@ import type {
   GridCalibration,
   GridPoint,
   PlannedActionIntent,
+  ResourceCostDefinition,
   ResourceDefinition,
   RollBonusConfig,
   RollProfileKey,
   RollAdjustment,
   RollKey,
+  SecondaryDamageDefinition,
+  ScheduledAction,
+  ScheduledActionTimingMode,
   Side,
   Strategy,
   Ability,
@@ -489,8 +513,11 @@ const splitList = (value: string) =>
 const abilityKeys = ['str', 'dex', 'con', 'int', 'wis', 'cha'] as const
 const actionKinds = ['attack', 'save', 'heal', 'manual'] as const
 const contentKinds = ['monster', 'player'] as const
+const damageApplicationOptions = ['immediate', 'modifier'] as const
+const damageTriggerOptions = ['hit', 'damage'] as const
+const damageAppliesToOptions = ['damage', 'attack', 'weaponAttack', 'meleeWeaponAttack'] as const
 const damageOnSaveOptions = ['none', 'half'] as const
-const recoveryKinds = ['round', 'shortRest', 'longRest', 'manual'] as const
+const recoveryKinds = ['round', 'shortRest', 'longRest', 'recharge', 'manual'] as const
 const sourceKinds = ['SRD', 'Custom', 'Third-party', 'Imported', 'Draft'] as const
 const targetKinds = ['enemy', 'ally', 'self', 'area', 'manual'] as const
 
@@ -558,6 +585,97 @@ const normalizeImportedEffects = (value: unknown): EffectDefinition[] | undefine
   return effects.length ? effects : undefined
 }
 
+const normalizeImportedSecondaryDamage = (value: unknown, fallbackSource: string): SecondaryDamageDefinition[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined
+  }
+
+  const damage = value
+    .map((entry, index): SecondaryDamageDefinition | undefined => {
+      const candidate = asRecord(entry)
+      if (!candidate) {
+        return undefined
+      }
+
+      const damageDice =
+        typeof candidate.damageDice === 'string'
+          ? candidate.damageDice
+          : typeof candidate.dice === 'string'
+            ? candidate.dice
+            : undefined
+
+      if (!damageDice) {
+        return undefined
+      }
+
+      const normalizedDamage: SecondaryDamageDefinition = {
+        id: stringField(candidate.id, `secondary-damage-${index}`),
+        damageDice,
+        source: typeof candidate.source === 'string' ? candidate.source : fallbackSource,
+        targetTypes: stringListField(candidate.targetTypes),
+      }
+      const damageType =
+        typeof candidate.damageType === 'string'
+          ? candidate.damageType
+          : typeof candidate.type === 'string'
+            ? candidate.type
+            : undefined
+
+      if (damageType) {
+        normalizedDamage.damageType = damageType
+      }
+
+      if (typeof candidate.condition === 'string') {
+        normalizedDamage.condition = candidate.condition
+      }
+
+      return normalizedDamage
+    })
+    .filter((entry): entry is SecondaryDamageDefinition => Boolean(entry))
+
+  return damage.length ? damage : undefined
+}
+
+const normalizeImportedSpellLevel = (value: unknown) => {
+  const spellLevel = optionalNumberField(value)
+  return typeof spellLevel === 'number' && spellLevel >= 0 ? Math.floor(spellLevel) : undefined
+}
+
+const normalizeImportedResourceCost = (
+  value: unknown,
+  fallbackSpellLevel?: number,
+): ResourceCostDefinition | undefined => {
+  const candidate = asRecord(value)
+  const amountSource = candidate ? candidate.amount ?? candidate.cost ?? candidate.uses : value
+  const amount = optionalNumberField(amountSource)
+  if (typeof amount !== 'number' || amount <= 0) {
+    return undefined
+  }
+
+  const resourceId =
+    typeof candidate?.resourceId === 'string'
+      ? candidate.resourceId
+      : typeof candidate?.id === 'string'
+        ? candidate.id
+        : fallbackSpellLevel && fallbackSpellLevel > 0
+          ? spellSlotResourceId(fallbackSpellLevel)
+          : undefined
+  const resourceLabel =
+    typeof candidate?.resourceLabel === 'string'
+      ? candidate.resourceLabel
+      : typeof candidate?.label === 'string'
+        ? candidate.label
+        : fallbackSpellLevel && fallbackSpellLevel > 0
+          ? spellSlotResourceLabel(fallbackSpellLevel)
+          : undefined
+
+  return {
+    resourceId,
+    resourceLabel,
+    amount: Math.max(1, Math.floor(amount)),
+  }
+}
+
 const normalizeImportedAction = (value: unknown, index: number): ActionDefinition | undefined => {
   const candidate = asRecord(value)
   if (!candidate) {
@@ -567,23 +685,54 @@ const normalizeImportedAction = (value: unknown, index: number): ActionDefinitio
   const name = stringField(candidate.name, `Imported Action ${index + 1}`)
   const kind = enumValue(candidate.kind, actionKinds, 'manual')
   const target = enumValue(candidate.target, targetKinds, kind === 'heal' ? 'ally' : kind === 'manual' ? 'manual' : 'enemy')
+  const description = typeof candidate.description === 'string' ? candidate.description : undefined
+  const tags = stringListField(candidate.tags)
+  const importedSpellLevel =
+    normalizeImportedSpellLevel(candidate.spellLevel) ??
+    (tags.some((tag) => tag.toLowerCase() === 'spell') ? normalizeImportedSpellLevel(candidate.level) : undefined)
+  const importedResourceCost =
+    normalizeImportedResourceCost(candidate.resourceCost, importedSpellLevel) ??
+    normalizeImportedResourceCost(
+      {
+        resourceId: candidate.resourceId,
+        resourceLabel: candidate.resourceLabel,
+        amount: candidate.resourceCostAmount ?? candidate.resourceAmount ?? candidate.costAmount,
+      },
+      importedSpellLevel,
+    )
+  const damageDice = typeof candidate.damageDice === 'string' ? candidate.damageDice : kind === 'heal' ? undefined : '0'
+  const inferredExtraDamage = description ? extraDamageFromText(description, typeof candidate.damageType === 'string' ? candidate.damageType : undefined) : undefined
+  const damageApplication =
+    optionalEnumValue(candidate.damageApplication, damageApplicationOptions) ??
+    (kind === 'manual' && damageDice && damageDice !== '0' && inferredExtraDamage ? 'modifier' : undefined)
+  const damageType = inferredExtraDamage?.damageType ?? (typeof candidate.damageType === 'string' ? candidate.damageType : undefined)
 
   return {
     id: stringField(candidate.id, slugify(name) || `imported-action-${index}`),
     name,
     kind,
     attackBonus: kind === 'attack' ? numberField(candidate.attackBonus, 0) : optionalNumberField(candidate.attackBonus),
-    damageDice: typeof candidate.damageDice === 'string' ? candidate.damageDice : kind === 'heal' ? undefined : '0',
-    damageType: typeof candidate.damageType === 'string' ? candidate.damageType : undefined,
+    damageDice: inferredExtraDamage?.damageDice ?? damageDice,
+    damageType,
     healingDice: typeof candidate.healingDice === 'string' ? candidate.healingDice : kind === 'heal' ? '1d4' : undefined,
     rangeFt: optionalNumberField(candidate.rangeFt),
     reachFt: optionalNumberField(candidate.reachFt),
     saveDc: kind === 'save' ? numberField(candidate.saveDc, 10) : optionalNumberField(candidate.saveDc),
     saveAbility: optionalEnumValue(candidate.saveAbility, abilityKeys),
     damageOnSave: optionalEnumValue(candidate.damageOnSave, damageOnSaveOptions),
+    damageApplication,
+    damageTrigger: optionalEnumValue(candidate.damageTrigger, damageTriggerOptions),
+    damageAppliesTo:
+      optionalEnumValue(candidate.damageAppliesTo, damageAppliesToOptions) ??
+      (damageApplication === 'modifier' ? (/melee weapon/i.test(description ?? '') ? 'meleeWeaponAttack' : 'weaponAttack') : undefined),
+    secondaryDamage:
+      normalizeImportedSecondaryDamage(candidate.secondaryDamage, name) ??
+      secondaryDamageFromText(description, name, damageType),
+    spellLevel: importedSpellLevel,
+    resourceCost: importedResourceCost,
     target,
-    tags: stringListField(candidate.tags),
-    description: typeof candidate.description === 'string' ? candidate.description : undefined,
+    tags,
+    description,
     effects: normalizeImportedEffects(candidate.effects),
   }
 }
@@ -596,13 +745,15 @@ const normalizeImportedResource = (value: unknown, index: number): ResourceDefin
 
   const label = stringField(candidate.label, `Resource ${index + 1}`)
   const max = Math.max(0, numberField(candidate.max, 0))
+  const recovery = enumValue(candidate.recovery, recoveryKinds, 'manual')
 
   return {
     id: stringField(candidate.id, slugify(label) || `imported-resource-${index}`),
     label,
     max,
-    current: Math.max(0, numberField(candidate.current, max)),
-    recovery: enumValue(candidate.recovery, recoveryKinds, 'manual'),
+    current: Math.min(max, Math.max(0, numberField(candidate.current, max))),
+    recovery,
+    rechargeMin: recovery === 'recharge' ? clampRechargeMin(optionalNumberField(candidate.rechargeMin ?? candidate.rechargeRoll)) : undefined,
   }
 }
 
@@ -620,6 +771,34 @@ const normalizeImportedContentEntry = (value: unknown, index: number): ContentEn
         .map((action, actionIndex) => normalizeImportedAction(action, actionIndex))
         .filter((action): action is ActionDefinition => Boolean(action))
     : []
+  const level = optionalNumberField(candidate.level)
+  const importedResources = Array.isArray(candidate.resources)
+    ? candidate.resources
+        .map((resource, resourceIndex) => normalizeImportedResource(resource, resourceIndex))
+        .filter((resource): resource is ResourceDefinition => Boolean(resource))
+    : []
+  const normalizedActions: ActionDefinition[] = actions.length
+    ? actions
+    : [
+        {
+          id: 'manual-ruling',
+          name: 'Manual Ruling',
+          kind: 'manual' as const,
+          reachFt: 5,
+          rangeFt: 30,
+          target: 'manual' as const,
+          tags: ['manual'],
+          description: 'Imported entry did not include configured actions.',
+        },
+      ]
+  const classIndex =
+    typeof candidate.classIndex === 'string'
+      ? candidate.classIndex
+      : typeof source?.apiIndex === 'string'
+        ? source.apiIndex
+        : typeof candidate.type === 'string'
+          ? candidate.type
+          : undefined
 
   return {
     id: stringField(candidate.id, `imported-${slugify(name) || 'entry'}-${Date.now()}-${index}`),
@@ -636,7 +815,7 @@ const normalizeImportedContentEntry = (value: unknown, index: number): ContentEn
     maxHp: Math.max(1, numberField(candidate.maxHp, 1)),
     speedFt: Math.max(0, numberField(candidate.speedFt, 30)),
     initiativeBonus: numberField(candidate.initiativeBonus, numberField(abilitySource.dex, 10) >= 10 ? 0 : -1),
-    level: optionalNumberField(candidate.level),
+    level,
     proficiencyBonus: optionalNumberField(candidate.proficiencyBonus),
     challenge: typeof candidate.challenge === 'string' ? candidate.challenge : undefined,
     size: typeof candidate.size === 'string' ? candidate.size : undefined,
@@ -655,25 +834,8 @@ const normalizeImportedContentEntry = (value: unknown, index: number): ContentEn
     immunities: stringListField(candidate.immunities),
     vulnerabilities: stringListField(candidate.vulnerabilities),
     traits: stringListField(candidate.traits),
-    resources: Array.isArray(candidate.resources)
-      ? candidate.resources
-          .map((resource, resourceIndex) => normalizeImportedResource(resource, resourceIndex))
-          .filter((resource): resource is ResourceDefinition => Boolean(resource))
-      : [],
-    actions: actions.length
-      ? actions
-      : [
-          {
-            id: 'manual-ruling',
-            name: 'Manual Ruling',
-            kind: 'manual',
-            reachFt: 5,
-            rangeFt: 30,
-            target: 'manual',
-            tags: ['manual'],
-            description: 'Imported entry did not include configured actions.',
-          },
-        ],
+    resources: ensureResourcesForActions(importedResources, normalizedActions, classIndex, level),
+    actions: normalizedActions,
     rollBonuses: asRecord(candidate.rollBonuses) as ContentEntry['rollBonuses'],
     notes: typeof candidate.notes === 'string' ? candidate.notes : undefined,
   }
@@ -726,23 +888,36 @@ const parseImportedContentEntries = (value: string) => {
 const draftActionToDefinition = (
   action: DraftAction,
   category: 'melee' | 'ranged' | 'spell' | 'custom',
-): ContentEntry['actions'][number] => ({
-  id: action.name.toLowerCase().replace(/[^a-z0-9]+/g, '-') || action.id,
-  name: action.name.trim() || 'Configured Action',
-  kind: action.kind,
-  attackBonus: action.kind === 'attack' ? action.attackBonus : undefined,
-  saveDc: action.kind === 'save' ? action.saveDc : undefined,
-  saveAbility: action.kind === 'save' ? action.saveAbility : undefined,
-  damageDice: action.kind === 'heal' ? undefined : action.damageDice,
-  healingDice: action.kind === 'heal' ? action.damageDice : undefined,
-  damageType: action.kind === 'heal' ? undefined : action.damageType,
-  damageOnSave: action.kind === 'save' ? action.damageOnSave : undefined,
-  reachFt: category === 'melee' ? Math.max(5, action.reachFt) : action.reachFt,
-  rangeFt: action.rangeFt,
-  target: action.kind === 'heal' ? 'ally' : action.kind === 'manual' ? 'manual' : 'enemy',
-  tags: [...new Set([category, ...splitList(action.tags)])],
-  description: action.description,
-})
+): ContentEntry['actions'][number] => {
+  const tags = [...new Set([category, ...splitList(action.tags)])]
+  const extraDamage = extraDamageFromText(action.description, action.damageType)
+  const isModifier =
+    action.kind === 'manual' &&
+    Boolean(action.damageDice && action.damageDice !== '0') &&
+    (tags.some((tag) => ['damage-modifier', 'modifier', 'on-hit', 'smite'].includes(tag.toLowerCase())) ||
+      Boolean(extraDamage))
+
+  return {
+    id: action.name.toLowerCase().replace(/[^a-z0-9]+/g, '-') || action.id,
+    name: action.name.trim() || 'Configured Action',
+    kind: action.kind,
+    attackBonus: action.kind === 'attack' ? action.attackBonus : undefined,
+    saveDc: action.kind === 'save' ? action.saveDc : undefined,
+    saveAbility: action.kind === 'save' ? action.saveAbility : undefined,
+    damageDice: action.kind === 'heal' ? undefined : extraDamage?.damageDice ?? action.damageDice,
+    healingDice: action.kind === 'heal' ? action.damageDice : undefined,
+    damageType: action.kind === 'heal' ? undefined : extraDamage?.damageType ?? action.damageType,
+    damageOnSave: action.kind === 'save' ? action.damageOnSave : undefined,
+    damageApplication: isModifier ? 'modifier' : action.kind === 'manual' && action.damageDice ? 'immediate' : undefined,
+    damageTrigger: isModifier ? 'hit' : undefined,
+    damageAppliesTo: isModifier ? (/melee weapon/i.test(action.description) ? 'meleeWeaponAttack' : 'weaponAttack') : undefined,
+    reachFt: category === 'melee' ? Math.max(5, action.reachFt) : action.reachFt,
+    rangeFt: action.rangeFt,
+    target: action.kind === 'heal' ? 'ally' : isModifier ? 'manual' : action.kind === 'manual' ? 'enemy' : 'enemy',
+    tags,
+    description: action.description,
+  }
+}
 
 const srdFighterDefaults: Record<Ability, number> = {
   str: 16,
@@ -772,6 +947,54 @@ const signed = (value: number) => `${value >= 0 ? '+' : ''}${value}`
 const damageWithAbility = (dice: string, modifier: number) => {
   const baseDice = dice.trim().match(/^(\d*d\d+)/i)?.[1] ?? (dice.trim() || '1d4')
   return modifier === 0 ? baseDice : `${baseDice}${signed(modifier)}`
+}
+
+const damageWithModifier = (expression: string, modifier: number) =>
+  modifier === 0 ? expression.trim() : `${expression.trim() || '0'}${signed(modifier)}`
+
+const extraDamageFromText = (description: string, fallbackType?: string) => {
+  const normalized = description.replace(/\s+/g, ' ')
+  const textDamageType = normalized.match(
+    /(acid|bludgeoning|cold|fire|force|lightning|necrotic|piercing|poison|psychic|radiant|slashing|thunder)\s+damage/i,
+  )?.[1]
+  const extraDamage =
+    normalized.match(/extra\s+(\d*d\d+(?:\s*[+-]\s*\d+)?)\s*([a-z]+)?\s+damage/i) ??
+    normalized.match(/extra damage is\s+(\d*d\d+(?:\s*[+-]\s*\d+)?)/i)
+  const hitTrigger = /(?:when|whenever|on)\s+(?:you\s+)?(?:hit|a hit)|weapon attacks?.*on a hit/i.test(normalized)
+
+  if (!extraDamage || !hitTrigger) {
+    return undefined
+  }
+
+  const damageType = extraDamage[2]?.toLowerCase()
+
+  return {
+    damageDice: extraDamage[1].replace(/\s+/g, ''),
+    damageType: damageType && damageType !== 'extra' ? damageType : fallbackType ?? textDamageType?.toLowerCase(),
+  }
+}
+
+const secondaryDamageFromText = (
+  description: string | undefined,
+  source: string,
+  fallbackType?: string,
+): SecondaryDamageDefinition[] | undefined => {
+  const normalized = description?.replace(/\s+/g, ' ') ?? ''
+  const undeadFiend = normalized.match(/(?:increases by|plus)\s+(\d*d\d+)\s+if\s+the target is an? undead or a fiend/i)
+  if (!undeadFiend) {
+    return undefined
+  }
+
+  return [
+    {
+      id: `${slugify(source) || 'damage'}-undead-fiend`,
+      damageDice: undeadFiend[1],
+      damageType: fallbackType,
+      source,
+      condition: 'target is undead or fiend',
+      targetTypes: ['undead', 'fiend'],
+    },
+  ]
 }
 
 const derivedPlayerMath = (draft: DraftContent) => {
@@ -1109,6 +1332,9 @@ const buildSrdSpellAction = (
   const spellDamage = spellDamageForLevel(spell, level)
   const spellSaveDc = 8 + proficiencyBonus + abilityMod
   const description = spell.desc?.[0] ?? ''
+  const spellDamageType = spell.damage?.damage_type?.name?.toLowerCase()
+  const extraDamage = extraDamageFromText(description, spellDamageType)
+  const spellResourceFields = spell.level > 0 ? { spellLevel: spell.level } : {}
 
   if (spell.dc && spell.damage) {
     return {
@@ -1118,10 +1344,11 @@ const buildSrdSpellAction = (
       saveDc: spellSaveDc,
       saveAbility: spell.dc.dc_type?.index ?? 'dex',
       damageDice: spellDamage,
-      damageType: spell.damage.damage_type?.name?.toLowerCase() ?? 'damage',
+      damageType: spellDamageType ?? 'damage',
       damageOnSave: spell.dc.dc_success === 'half' ? 'half' : 'none',
       rangeFt: parseRangeFt(spell.range),
       reachFt: 0,
+      ...spellResourceFields,
       target: 'enemy',
       tags: ['srd', 'spell', selectedClass?.index ?? 'class'],
       description: `${description} Save DC ${spellSaveDc} = 8 + proficiency ${proficiencyBonus} + ${ability.toUpperCase()} ${signed(abilityMod)}.`,
@@ -1135,12 +1362,49 @@ const buildSrdSpellAction = (
       kind: 'attack',
       attackBonus: proficiencyBonus + abilityMod,
       damageDice: spellDamage,
-      damageType: spell.damage.damage_type?.name?.toLowerCase() ?? 'damage',
+      damageType: spellDamageType ?? 'damage',
       rangeFt: parseRangeFt(spell.range),
       reachFt: spell.attack_type === 'melee' ? 5 : 0,
+      ...spellResourceFields,
       target: 'enemy',
       tags: ['srd', 'spell', selectedClass?.index ?? 'class'],
       description: `${description} Spell attack ${signed(proficiencyBonus + abilityMod)} = proficiency ${proficiencyBonus} + ${ability.toUpperCase()} ${signed(abilityMod)}.`,
+    }
+  }
+
+  if (extraDamage) {
+    return {
+      id: `spell-${spell.index}`,
+      name: spell.name,
+      kind: 'manual',
+      damageDice: extraDamage.damageDice,
+      damageType: extraDamage.damageType ?? spellDamageType ?? 'damage',
+      damageApplication: 'modifier',
+      damageTrigger: 'hit',
+      damageAppliesTo: /melee weapon/i.test(description) ? 'meleeWeaponAttack' : 'weaponAttack',
+      rangeFt: parseRangeFt(spell.range),
+      reachFt: 0,
+      ...spellResourceFields,
+      target: 'manual',
+      tags: ['srd', 'spell', 'damage-modifier', 'manual', selectedClass?.index ?? 'class'],
+      description: `${description} Damage modifier ${extraDamage.damageDice} ${extraDamage.damageType ?? spellDamageType ?? 'damage'}; apply after a landed weapon hit.`,
+    }
+  }
+
+  if (spell.damage) {
+    return {
+      id: `spell-${spell.index}`,
+      name: spell.name,
+      kind: 'manual',
+      damageDice: spellDamage,
+      damageType: spellDamageType ?? 'damage',
+      damageApplication: 'immediate',
+      rangeFt: parseRangeFt(spell.range),
+      reachFt: 0,
+      ...spellResourceFields,
+      target: 'enemy',
+      tags: ['srd', 'spell', 'direct-damage', 'manual', selectedClass?.index ?? 'class'],
+      description: `${description} Direct damage ${spellDamage} ${spellDamageType ?? 'damage'}; roll without attack or save.`,
     }
   }
 
@@ -1150,10 +1414,75 @@ const buildSrdSpellAction = (
     kind: 'manual',
     rangeFt: parseRangeFt(spell.range),
     reachFt: 0,
+    ...spellResourceFields,
     target: 'manual',
     tags: ['srd', 'spell', 'manual', selectedClass?.index ?? 'class'],
     description: `${description} This SRD spell needs manual adjudication in the current engine.`,
   }
+}
+
+const buildSrdFeatureActions = (
+  selectedClass: SrdClass | undefined,
+  level: number,
+): ContentEntry['actions'][number][] => {
+  if (selectedClass?.index !== 'paladin') {
+    return []
+  }
+
+  const actions: ContentEntry['actions'][number][] = []
+  const divineSmiteConditional: SecondaryDamageDefinition = {
+    id: 'divine-smite-undead-fiend',
+    damageDice: '1d8',
+    damageType: 'radiant',
+    source: 'Divine Smite',
+    condition: 'target is undead or fiend',
+    targetTypes: ['undead', 'fiend'],
+  }
+
+  if (level >= 2) {
+    actions.push({
+      id: 'feature-divine-smite',
+      name: 'Divine Smite',
+      kind: 'manual',
+      damageDice: '2d8',
+      damageType: 'radiant',
+      damageApplication: 'modifier',
+      damageTrigger: 'hit',
+      damageAppliesTo: 'meleeWeaponAttack',
+      secondaryDamage: [divineSmiteConditional],
+      resourceCost: {
+        resourceId: spellSlotResourceId(1),
+        resourceLabel: spellSlotResourceLabel(1),
+        amount: 1,
+      },
+      rangeFt: 5,
+      reachFt: 5,
+      target: 'manual',
+      tags: ['srd', 'feature', 'damage-modifier', 'smite', 'paladin'],
+      description:
+        'When you hit a creature with a melee weapon attack, expend a spell slot to deal 2d8 radiant damage, plus 1d8 against undead or fiends.',
+    })
+  }
+
+  if (level >= 11) {
+    actions.push({
+      id: 'feature-improved-divine-smite',
+      name: 'Improved Divine Smite',
+      kind: 'manual',
+      damageDice: '1d8',
+      damageType: 'radiant',
+      damageApplication: 'modifier',
+      damageTrigger: 'hit',
+      damageAppliesTo: 'meleeWeaponAttack',
+      rangeFt: 5,
+      reachFt: 5,
+      target: 'manual',
+      tags: ['srd', 'feature', 'damage-modifier', 'smite', 'paladin'],
+      description: 'Melee weapon hits deal an extra 1d8 radiant damage.',
+    })
+  }
+
+  return actions
 }
 
 const buildSrdCharacterEntry = (
@@ -1181,10 +1510,17 @@ const buildSrdCharacterEntry = (
     ...selectedWeapons.map((weapon) =>
       buildSrdWeaponAction(weapon, selectedClass, proficiencyBonus, draft.attackAbility, attackMod),
     ),
+    ...buildSrdFeatureActions(selectedClass, draft.level),
     ...selectedSpells.map((spell) =>
       buildSrdSpellAction(spell, selectedClass, draft.level, proficiencyBonus, draft.spellAbility, spellMod),
     ),
   ]
+  const resources = ensureResourcesForActions(
+    buildSpellSlotResources(selectedClass?.index, draft.level),
+    actions,
+    selectedClass?.index,
+    draft.level,
+  )
 
   return {
     id: `srd-character-${draft.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}`,
@@ -1218,7 +1554,7 @@ const buildSrdCharacterEntry = (
         .join(', ') ?? 'none'}.`,
       ...(selectedRace?.traits?.map((trait) => `Trait: ${trait.name}`) ?? []),
     ],
-    resources: [],
+    resources,
     actions: [
       ...actions,
       {
@@ -1417,32 +1753,209 @@ const optionalNumberValue = (value: string) => {
   return Math.max(0, numberValue(value))
 }
 
-const createStatusId = (prefix: 'condition' | 'effect' | 'planned-action') =>
+const clampResourceCurrent = (resource: Pick<ResourceDefinition, 'max'>, current: number) =>
+  Math.min(resource.max, Math.max(0, current))
+
+const clampRechargeMin = (value: number | undefined) =>
+  Math.min(6, Math.max(2, Math.round(value ?? 6)))
+
+const resourceRecoveryLabel = (recovery: ResourceDefinition['recovery']) =>
+  recovery === 'shortRest'
+    ? 'short rest'
+    : recovery === 'longRest'
+    ? 'long rest'
+    : recovery === 'recharge'
+    ? 'recharge d6'
+    : recovery === 'round'
+    ? 'round'
+    : 'manual'
+
+const resourceRecoveryOrder: ResourceDefinition['recovery'][] = ['round', 'shortRest', 'longRest', 'recharge', 'manual']
+
+const summarizeResourceRecoveries = (resources: ResourceDefinition[]) =>
+  resourceRecoveryOrder
+    .map((recovery) => {
+      const count = resources.filter((resource) => resource.recovery === recovery).length
+      return count ? `${count} ${resourceRecoveryLabel(recovery)}` : ''
+    })
+    .filter(Boolean)
+    .join(' / ')
+
+const createStatusId = (prefix: 'condition' | 'effect' | 'planned-action' | 'scheduled-action') =>
   `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+
+const createResourceId = () => `resource-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+
+const createActionId = (base = 'action') => `${base}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+
+const inferCombatantClassIndex = (combatant: Pick<Combatant, 'source'>) => {
+  const apiIndex = combatant.source.apiIndex
+  if (!apiIndex || !apiIndex.includes('-')) {
+    return undefined
+  }
+
+  const parts = apiIndex.split('-').filter(Boolean)
+  return parts.length ? parts[parts.length - 1] : undefined
+}
+
+const inferCombatantSpellAbility = (combatant: Combatant): Ability => {
+  const candidates: Ability[] = ['wis', 'int', 'cha']
+  return candidates.reduce(
+    (best, ability) => (combatant.abilityScores[ability] > combatant.abilityScores[best] ? ability : best),
+    'wis' as Ability,
+  )
+}
+
+const cloneCombatantAction = (action: ActionDefinition): ActionDefinition => ({
+  ...action,
+  id: createActionId(action.id),
+  tags: [...action.tags],
+  effects: action.effects?.map((effect) => ({
+    ...effect,
+    id: createStatusId('effect'),
+  })),
+  secondaryDamage: action.secondaryDamage?.map((damage) => ({
+    ...damage,
+    id: createActionId(damage.id),
+    targetTypes: damage.targetTypes ? [...damage.targetTypes] : undefined,
+  })),
+})
 
 const defaultRollBonus = (): RollBonusConfig => ({
   proficient: false,
+  expertise: false,
   bonus: 0,
+  advantage: false,
+  disadvantage: false,
 })
 
 const primaryActionIdFor = (combatant?: Combatant) =>
   combatant?.intent.actionQueue?.[0]?.actionId ?? combatant?.intent.actionId
 
-const selectedActionFor = (combatant?: Combatant) =>
-  combatant?.actions.find((action) => action.id === primaryActionIdFor(combatant)) ?? combatant?.actions[0]
+const selectedActionFor = (combatant?: Combatant) => {
+  const actionId = primaryActionIdFor(combatant)
+  if (isNoActionId(actionId)) {
+    return undefined
+  }
+
+  return combatant?.actions.find((action) => action.id === actionId) ?? combatant?.actions[0]
+}
+
+const supportsChosenHealingAmount = (action?: ActionDefinition) =>
+  action?.kind === 'heal' &&
+  (action.tags.some((tag) => ['lay-on-hands', 'heal-pool', 'variable-heal-pool'].includes(tag)) ||
+    /lay on hands/i.test(action.name))
+
+const actionSourceLabel = (action: ActionDefinition | undefined, combatant: Combatant) => {
+  if (!action) {
+    return combatant.source.book ?? combatant.source.kind
+  }
+
+  const sourceParts = [
+    action.tags.includes('srd') ? 'SRD' : undefined,
+    action.tags.includes('spell') ? 'spell' : undefined,
+    action.tags.includes('feature') ? 'feature' : undefined,
+    action.tags.includes('weapon') ? 'weapon' : undefined,
+  ].filter(Boolean)
+
+  const sourceKind = sourceParts.length ? sourceParts.join(' ') : combatant.source.book ?? combatant.source.kind
+
+  return `${action.name} · ${sourceKind}`
+}
+
+const defaultTargetIdForAction = (combatant: Pick<Combatant, 'id' | 'actions'>, actionId?: string) =>
+  combatant.actions.find((action) => action.id === actionId)?.kind === 'heal' ? combatant.id : undefined
+
+const scheduledActionTimingModes: ScheduledActionTimingMode[] = ['initiativeCount', 'beforeCombatant', 'afterCombatant']
+
+const scheduledActionTimingLabel = (mode: ScheduledActionTimingMode) =>
+  mode === 'beforeCombatant'
+    ? 'Before combatant'
+    : mode === 'afterCombatant'
+      ? 'After combatant'
+      : 'Initiative count'
+
+const firstCombatantId = (combatants: Combatant[]) => combatants[0]?.id
+
+const normalizeScheduledAction = (raw: Partial<ScheduledAction>, combatants: Combatant[]): ScheduledAction | undefined => {
+  const owner = combatants.find((combatant) => combatant.id === raw.ownerCombatantId)
+  if (!owner) {
+    return undefined
+  }
+
+  const mode = optionalEnumValue(raw.timingMode, scheduledActionTimingModes) ?? 'initiativeCount'
+  const availableActionIds = new Set(owner.actions.map((action) => action.id))
+  const actionId = isNoActionId(raw.actionId)
+    ? noActionId
+    : raw.actionId && availableActionIds.has(raw.actionId)
+      ? raw.actionId
+      : owner.actions[0]?.id ?? noActionId
+
+  const action = owner.actions.find((candidate) => candidate.id === actionId)
+
+  const initiativeCount = mode === 'initiativeCount' && Number.isFinite(Number(raw.initiativeCount))
+    ? Math.trunc(Number(raw.initiativeCount))
+    : undefined
+
+  const validTriggerCombatantId = raw.triggerCombatantId && combatants.some((combatant) => combatant.id === raw.triggerCombatantId)
+    ? raw.triggerCombatantId
+    : mode === 'initiativeCount'
+      ? undefined
+      : firstCombatantId(combatants)
+
+  if (mode !== 'initiativeCount' && !validTriggerCombatantId) {
+    return undefined
+  }
+
+  const rawTargetId = typeof raw.targetId === 'string' ? raw.targetId : undefined
+  const targetId =
+    isNoActionId(actionId) || action?.kind === 'heal'
+      ? owner.id
+      : rawTargetId && combatants.some((combatant) => combatant.id === rawTargetId)
+        ? rawTargetId
+        : undefined
+
+  return {
+    id: stringField(raw.id, createStatusId('scheduled-action')),
+    ownerCombatantId: owner.id,
+    actionId,
+    timingMode: mode,
+    initiativeCount,
+    triggerCombatantId: mode === 'initiativeCount' ? undefined : validTriggerCombatantId,
+    targetId,
+    healingAmount: supportsChosenHealingAmount(action) && Number.isFinite(Number(raw.healingAmount))
+      ? Math.max(1, Math.trunc(Number(raw.healingAmount)))
+      : undefined,
+  }
+}
+
+const normalizeScheduledActions = (battle: BattleState): ScheduledAction[] => {
+  const combatants = battle.combatants
+  if (!Array.isArray(battle.scheduledActions)) {
+    return []
+  }
+
+  return battle.scheduledActions
+    .map((scheduledAction) => normalizeScheduledAction(scheduledAction, combatants))
+    .filter((scheduledAction): scheduledAction is ScheduledAction => Boolean(scheduledAction))
+}
 
 const combatantProficiencyBonus = (combatant: Pick<Combatant, 'level' | 'proficiencyBonus'>) =>
   combatant.proficiencyBonus ?? proficiencyBonusForLevel(combatant.level ?? 1)
 
-const rollBonusConfig = (combatant: Combatant, key: RollProfileKey): RollBonusConfig => ({
+const normalizeRollBonusConfig = (config?: Partial<RollBonusConfig>): RollBonusConfig => ({
   ...defaultRollBonus(),
-  ...(combatant.rollBonuses?.[key] ?? {}),
+  ...(config ?? {}),
+})
+
+const rollBonusConfig = (combatant: Combatant, key: RollProfileKey): RollBonusConfig => ({
+  ...normalizeRollBonusConfig(combatant.rollBonuses?.[key]),
 })
 
 const rollBonusTotal = (combatant: Combatant, key: RollProfileKey) => {
   const config = rollBonusConfig(combatant, key)
 
-  return config.bonus + (config.proficient ? combatantProficiencyBonus(combatant) : 0)
+  return config.bonus + (config.proficient ? combatantProficiencyBonus(combatant) * (config.expertise ? 2 : 1) : 0)
 }
 
 const normalizeCondition = (condition: unknown, index: number): CombatantCondition => {
@@ -1484,32 +1997,41 @@ const createDefaultRollAdjustments = (): NonNullable<ActionIntent['rollAdjustmen
 
 const normalizeCombatantIntent = (combatant: Combatant): ActionIntent => {
   const intent = combatant.intent as Partial<ActionIntent> | undefined
-  const availableActionIds = new Set(combatant.actions.map((action) => action.id))
+  const availableActionIds = new Set([...combatant.actions.map((action) => action.id), noActionId])
   const fallbackActionId =
     intent?.actionId && availableActionIds.has(intent.actionId)
       ? intent.actionId
-      : combatant.actions[0]?.id ?? 'manual'
+      : combatant.actions[0]?.id ?? noActionId
   const rawQueue = Array.isArray(intent?.actionQueue) ? intent.actionQueue : []
-  const actionQueue = rawQueue
+  const actionQueue: PlannedActionIntent[] = rawQueue
     .filter((plannedAction) => plannedAction?.actionId && availableActionIds.has(plannedAction.actionId))
-    .map((plannedAction, index) => ({
-      id: plannedAction.id ?? `planned-action-restored-${index}`,
-      actionId: plannedAction.actionId,
-      targetId: plannedAction.targetId,
-    }))
+    .map((plannedAction, index) => {
+      const action = combatant.actions.find((candidate) => candidate.id === plannedAction.actionId)
+
+      return {
+        id: plannedAction.id ?? `planned-action-restored-${index}`,
+        actionId: plannedAction.actionId,
+        targetId: plannedAction.targetId ?? defaultTargetIdForAction(combatant, plannedAction.actionId),
+        healingAmount: supportsChosenHealingAmount(action) ? plannedAction.healingAmount : undefined,
+      }
+    })
 
   if (!actionQueue.length) {
     actionQueue.push({
       id: 'planned-action-restored-0',
       actionId: fallbackActionId,
-      targetId: intent?.targetId,
+      targetId: defaultTargetIdForAction(combatant, fallbackActionId) ?? intent?.targetId,
+      healingAmount: undefined,
     })
   }
 
   return {
     actionId: actionQueue[0]?.actionId ?? fallbackActionId,
     actionQueue,
-    targetId: intent?.targetId ?? actionQueue[0]?.targetId,
+    targetId:
+      actionQueue[0]?.targetId ??
+      defaultTargetIdForAction(combatant, actionQueue[0]?.actionId ?? fallbackActionId) ??
+      intent?.targetId,
     destination: intent?.destination,
     advantage: intent?.advantage ?? false,
     disadvantage: intent?.disadvantage ?? false,
@@ -1521,28 +2043,84 @@ const normalizeCombatantIntent = (combatant: Combatant): ActionIntent => {
   }
 }
 
-const normalizeCombatantStatuses = (combatant: Combatant): Combatant => ({
-  ...combatant,
-  conditions: Array.isArray(combatant.conditions)
-    ? combatant.conditions.map(normalizeCondition)
-    : [],
-  activeEffects: Array.isArray(combatant.activeEffects)
-    ? combatant.activeEffects.map(normalizeEffect)
-    : [],
-  actions: combatant.actions.map((action) => ({
+const normalizeCombatantStatuses = (combatant: Combatant): Combatant => {
+  const normalizedActions = (combatant.actions ?? []).map((action) => ({
     ...action,
     tags: [...action.tags],
     effects: action.effects?.map((effect) => ({ ...effect })),
-  })),
-  rollBonuses: combatant.rollBonuses ?? {},
-  intent: normalizeCombatantIntent(combatant),
-})
+    secondaryDamage: action.secondaryDamage?.map((damage) => ({
+      ...damage,
+      targetTypes: damage.targetTypes ? [...damage.targetTypes] : undefined,
+    })),
+  }))
+  const normalizedCombatant: Combatant = {
+    ...combatant,
+    conditions: Array.isArray(combatant.conditions)
+      ? combatant.conditions.map(normalizeCondition)
+      : [],
+    activeEffects: Array.isArray(combatant.activeEffects)
+      ? combatant.activeEffects.map(normalizeEffect)
+      : [],
+    actions: normalizedActions,
+    resources: ensureResourcesForActions(
+      (combatant.resources ?? []).map((resource) => {
+        const max = Math.max(0, Math.round(resource.max))
+        return {
+          ...resource,
+          id: resource.id || createResourceId(),
+          max,
+          current: clampResourceCurrent(resource, Math.min(max, Math.max(0, Math.round(resource.current)))),
+          recovery: recoveryKinds.includes(resource.recovery) ? resource.recovery : 'manual',
+          rechargeMin: resource.recovery === 'recharge' ? clampRechargeMin(resource.rechargeMin) : undefined,
+        }
+      }),
+      normalizedActions,
+      inferCombatantClassIndex(combatant),
+      combatant.level,
+    ),
+    rollBonuses: Object.fromEntries(
+      Object.entries(combatant.rollBonuses ?? {}).map(([key, config]) => [key, normalizeRollBonusConfig(config)]),
+    ) as Partial<Record<RollProfileKey, RollBonusConfig>>,
+  }
 
-const normalizeBattleState = (battle: BattleState): BattleState => ({
-  ...battle,
-  status: battle.status === 'active' ? 'active' : 'setup',
-  combatants: battle.combatants.map(normalizeCombatantStatuses),
-})
+  return {
+    ...normalizedCombatant,
+    intent: normalizeCombatantIntent(normalizedCombatant),
+  }
+}
+
+const normalizeBattleState = (battle: BattleState): BattleState => {
+  const combatants = battle.combatants.map(normalizeCombatantStatuses)
+  const scheduledActions = normalizeScheduledActions({
+    ...battle,
+    combatants,
+    scheduledActions: battle.scheduledActions,
+  })
+  const timeline = getBattleTimeline({
+    ...battle,
+    combatants,
+    scheduledActions,
+  })
+  const normalizedRound = Math.max(1, Math.trunc(Number.isFinite(battle.round) ? battle.round : 1))
+  const currentTimelineItemIndex = Number.isFinite(battle.timelineCursor?.itemIndex) ? Math.trunc(battle.timelineCursor.itemIndex) : 0
+  const timelineCursorRound = battle.timelineCursor?.round === normalizedRound ? normalizedRound : normalizedRound
+  const selectedCombatantId = combatants.some((combatant) => combatant.id === battle.selectedCombatantId)
+    ? battle.selectedCombatantId
+    : combatants[0]?.id
+
+  return {
+    ...battle,
+    status: battle.status === 'active' ? 'active' : 'setup',
+    round: Math.max(1, normalizedRound),
+    combatants,
+    scheduledActions,
+    selectedCombatantId,
+    timelineCursor: {
+      round: timelineCursorRound,
+      itemIndex: Math.max(0, Math.min(currentTimelineItemIndex, Math.max(0, timeline.length - 1))),
+    },
+  }
+}
 
 const readInitialBattleMap = () => {
   const storedMap = readJsonState<BattleMap>(mapKey, defaultMap)
@@ -1855,9 +2433,14 @@ function App() {
     void loadInitialSrdContent()
   }, [srdCharacter.classIndex, srdCharacter.raceIndex, srdCharacter.spellIndex, srdCharacter.weaponIndex])
 
+  const activeCombatantId = useMemo(
+    () => (battle.status === 'active' ? getCurrentTimelineCombatantId(battle) : undefined),
+    [battle],
+  )
+  const selectedCombatantId = activeCombatantId ?? battle.selectedCombatantId
   const selectedCombatant = useMemo(
-    () => battle.combatants.find((combatant) => combatant.id === battle.selectedCombatantId),
-    [battle.combatants, battle.selectedCombatantId],
+    () => battle.combatants.find((combatant) => combatant.id === selectedCombatantId),
+    [battle.combatants, selectedCombatantId],
   )
 
   const filteredLibrary = useMemo(() => {
@@ -1928,11 +2511,42 @@ function App() {
     setInspectorTab('details')
   }
 
+  const rebaseBattleCursor = (battle: BattleState) => {
+    const nextScheduledActions = normalizeScheduledActions({
+      ...battle,
+      combatants: battle.combatants,
+      scheduledActions: battle.scheduledActions,
+    })
+    const timeline = getBattleTimeline({
+      ...battle,
+      combatants: battle.combatants,
+      scheduledActions: nextScheduledActions,
+    })
+    const requestedItemIndex = Math.trunc(Number.isFinite(battle.timelineCursor?.itemIndex) ? battle.timelineCursor.itemIndex : 0)
+    const round = Math.max(1, Math.trunc(Number.isFinite(battle.round) ? battle.round : 1))
+    const selectedCombatantId = battle.combatants.some((combatant) => combatant.id === battle.selectedCombatantId)
+      ? battle.selectedCombatantId
+      : battle.combatants[0]?.id
+
+    return {
+      ...battle,
+      round,
+      status: battle.status === 'active' ? 'active' : 'setup',
+      selectedCombatantId,
+      scheduledActions: nextScheduledActions,
+      timelineCursor: {
+        round,
+        itemIndex: Math.max(0, Math.min(requestedItemIndex, Math.max(0, timeline.length - 1))),
+      },
+      log: Array.isArray(battle.log) ? battle.log : [],
+    } as BattleState
+  }
+
   const updateCombatant = (id: string, patch: Partial<Combatant>) => {
-    setBattle((current) => ({
+    setBattle((current) => rebaseBattleCursor({
       ...current,
       combatants: current.combatants.map((combatant) =>
-        combatant.id === id ? { ...combatant, ...patch } : combatant,
+        combatant.id === id ? normalizeCombatantStatuses({ ...combatant, ...patch }) : combatant,
       ),
     }))
   }
@@ -1947,12 +2561,25 @@ function App() {
 
         const nextIntent: ActionIntent = { ...combatant.intent, ...patch }
         if (patch.actionId && !patch.actionQueue) {
+          const nextAction = combatant.actions.find((action) => action.id === patch.actionId)
+          const nextTargetId =
+            patch.targetId ?? (nextAction?.kind === 'heal' ? combatant.id : nextIntent.targetId)
           const currentQueue = nextIntent.actionQueue?.length
             ? nextIntent.actionQueue
-            : [{ id: createStatusId('planned-action'), actionId: patch.actionId, targetId: nextIntent.targetId }]
+            : [{ id: createStatusId('planned-action'), actionId: patch.actionId, targetId: nextTargetId }]
           nextIntent.actionQueue = currentQueue.map((plannedAction, index) =>
-            index === 0 ? { ...plannedAction, actionId: patch.actionId } : plannedAction,
+            index === 0
+              ? {
+                  ...plannedAction,
+                  actionId: patch.actionId,
+                  targetId: nextAction?.kind === 'heal' ? combatant.id : patch.targetId ?? plannedAction.targetId,
+                  healingAmount: supportsChosenHealingAmount(nextAction) ? plannedAction.healingAmount : undefined,
+                }
+              : plannedAction,
           )
+          if (nextAction?.kind === 'heal') {
+            nextIntent.targetId = combatant.id
+          }
         }
 
         if (patch.targetId !== undefined && !patch.actionQueue && nextIntent.actionQueue?.length) {
@@ -1967,14 +2594,85 @@ function App() {
   }
 
   const removeCombatant = (id: string) => {
-    setBattle((current) => ({
-      ...current,
-      combatants: current.combatants.filter((combatant) => combatant.id !== id),
-      selectedCombatantId:
-        current.selectedCombatantId === id
-          ? current.combatants.find((combatant) => combatant.id !== id)?.id
-          : current.selectedCombatantId,
-    }))
+    setBattle((current) => {
+      const nextCombatants = current.combatants.filter((combatant) => combatant.id !== id)
+      return rebaseBattleCursor({
+        ...current,
+        combatants: nextCombatants,
+        selectedCombatantId:
+          current.selectedCombatantId === id
+            ? nextCombatants[0]?.id
+            : current.selectedCombatantId,
+        scheduledActions: current.scheduledActions.filter(
+          (scheduledAction) =>
+            scheduledAction.ownerCombatantId !== id && scheduledAction.triggerCombatantId !== id,
+        ),
+      } as BattleState)
+    })
+  }
+
+  const addScheduledAction = (ownerCombatantId: string, action?: Partial<ScheduledAction>) => {
+    setBattle((current) => {
+      const owner = current.combatants.find((combatant) => combatant.id === ownerCombatantId)
+      const fallbackActionId = owner?.actions[0]?.id ?? noActionId
+      const nextAction = normalizeScheduledAction(
+        {
+          ...action,
+          id: createStatusId('scheduled-action'),
+          ownerCombatantId,
+          actionId: action?.actionId ?? fallbackActionId,
+          timingMode: action?.timingMode ?? 'initiativeCount',
+          initiativeCount: action?.initiativeCount ?? owner?.initiative ?? 0,
+          targetId: action?.targetId,
+        },
+        current.combatants,
+      )
+
+      if (!nextAction) {
+        return current
+      }
+
+      return rebaseBattleCursor({
+        ...current,
+        scheduledActions: [...current.scheduledActions, nextAction],
+      })
+    })
+  }
+
+  const updateScheduledAction = (actionId: string, patch: Partial<ScheduledAction>) => {
+    setBattle((current) => {
+      const nextActions = current.scheduledActions
+        .map((scheduledAction) => {
+          if (scheduledAction.id !== actionId) {
+            return scheduledAction
+          }
+
+          const normalized = normalizeScheduledAction(
+            {
+              ...scheduledAction,
+              ...patch,
+              id: actionId,
+            },
+            current.combatants,
+          )
+
+          return normalized ?? scheduledAction
+        })
+
+      return rebaseBattleCursor({
+        ...current,
+        scheduledActions: nextActions,
+      })
+    })
+  }
+
+  const removeScheduledAction = (actionId: string) => {
+    setBattle((current) =>
+      rebaseBattleCursor({
+        ...current,
+        scheduledActions: current.scheduledActions.filter((scheduledAction) => scheduledAction.id !== actionId),
+      }),
+    )
   }
 
   const loadSrdIndex = async () => {
@@ -2549,7 +3247,7 @@ function App() {
             <Roster
               encounterName={encounterName}
               combatants={battle.combatants}
-              selectedId={battle.selectedCombatantId}
+              selectedId={selectedCombatantId}
               onSelect={selectCombatantSheet}
               onRenameEncounter={renameEncounter}
             />
@@ -2562,7 +3260,7 @@ function App() {
               tacticalMapState={tacticalMapState}
               setTacticalMapState={setTacticalMapState}
               combatants={battle.combatants}
-              selectedCombatantId={battle.selectedCombatantId}
+              selectedCombatantId={selectedCombatantId}
               onSelectCombatant={selectCombatantSheet}
               onSetDestination={(id, destination) => updateIntent(id, { destination })}
             />
@@ -2571,8 +3269,11 @@ function App() {
               <CombatLog entries={battle.log} />
               <RoundControls
                 battle={battle}
+                activeCombatantId={selectedCombatantId}
+                onSelectCombatant={selectCombatantSheet}
                 onRollInitiative={() => setBattle((current) => rollInitiative(current))}
                 onAutoPlan={() => setBattle((current) => autoPlanRound(current))}
+                onResolveTurn={() => setBattle((current) => resolveCurrentTurn(current))}
                 onResolve={() => setBattle((current) => resolveRound(current))}
                 onResetHp={() => setBattle((current) => longRestBattle(current))}
                 onRemoveDefeated={() => setBattle((current) => removeDefeated(current))}
@@ -2584,10 +3285,16 @@ function App() {
             <ActionInspector
               combatant={selectedCombatant}
               combatants={battle.combatants}
+              library={library}
+              scheduledActions={battle.scheduledActions}
               activeTab={inspectorTab}
               onActiveTabChange={setInspectorTab}
+              allowActionEditing={false}
               onUpdateCombatant={updateCombatant}
               onUpdateIntent={updateIntent}
+              onAddScheduledAction={addScheduledAction}
+              onUpdateScheduledAction={updateScheduledAction}
+              onRemoveScheduledAction={removeScheduledAction}
               onRemoveCombatant={removeCombatant}
             />
           </aside>
@@ -2598,12 +3305,17 @@ function App() {
         <CombatantManagementPage
           combatants={battle.combatants}
           selectedCombatant={selectedCombatant}
-          selectedId={battle.selectedCombatantId}
+          selectedId={selectedCombatantId}
+          library={library}
           activeInspectorTab={inspectorTab}
+          scheduledActions={battle.scheduledActions}
           onActiveInspectorTabChange={setInspectorTab}
           onSelect={selectCombatantSheet}
           onUpdateCombatant={updateCombatant}
           onUpdateIntent={updateIntent}
+          onAddScheduledAction={addScheduledAction}
+          onUpdateScheduledAction={updateScheduledAction}
+          onRemoveScheduledAction={removeScheduledAction}
           onRemoveCombatant={removeCombatant}
         />
       ) : null}
@@ -2615,7 +3327,7 @@ function App() {
             <Roster
               encounterName={encounterName}
               combatants={battle.combatants}
-              selectedId={battle.selectedCombatantId}
+              selectedId={selectedCombatantId}
               onSelect={selectCombatantSheet}
               onRenameEncounter={renameEncounter}
             />
@@ -2631,20 +3343,30 @@ function CombatantManagementPage({
   selectedCombatant,
   selectedId,
   activeInspectorTab,
+  library,
+  scheduledActions,
   onActiveInspectorTabChange,
   onSelect,
   onUpdateCombatant,
   onUpdateIntent,
+  onAddScheduledAction,
+  onUpdateScheduledAction,
+  onRemoveScheduledAction,
   onRemoveCombatant,
 }: {
   combatants: Combatant[]
   selectedCombatant?: Combatant
   selectedId?: string
   activeInspectorTab: InspectorTab
+  library: ContentEntry[]
+  scheduledActions: ScheduledAction[]
   onActiveInspectorTabChange: (tab: InspectorTab) => void
   onSelect: (id: string) => void
   onUpdateCombatant: (id: string, patch: Partial<Combatant>) => void
   onUpdateIntent: (id: string, patch: Partial<ActionIntent>) => void
+  onAddScheduledAction: (ownerId: string, action?: Partial<ScheduledAction>) => void
+  onUpdateScheduledAction: (id: string, patch: Partial<ScheduledAction>) => void
+  onRemoveScheduledAction: (id: string) => void
   onRemoveCombatant: (id: string) => void
 }) {
   return (
@@ -2678,52 +3400,22 @@ function CombatantManagementPage({
       <section className="panel action-catalog">
         <PanelHeading icon={<Swords size={18} />} title="Action Catalog" />
         {selectedCombatant ? (
-          <div className="combatant-detail-stack">
-            <div className="stat-chip-grid">
-              {abilities.map((ability) => (
-                <div key={ability}>
-                  <span>{ability.toUpperCase()}</span>
-                  <strong>{selectedCombatant.abilityScores[ability]}</strong>
-                  <small>{signed(abilityModifier(selectedCombatant.abilityScores[ability]))}</small>
-                </div>
-              ))}
-            </div>
-            <div className="trait-summary-grid">
-              <div>
-                <span>Saves</span>
-                <strong>{selectedCombatant.saveProficiencies?.map((ability) => ability.toUpperCase()).join(', ') || 'none'}</strong>
-              </div>
-              <div>
-                <span>Resist</span>
-                <strong>{selectedCombatant.resistances?.join(', ') || 'none'}</strong>
-              </div>
-              <div>
-                <span>Immune</span>
-                <strong>{selectedCombatant.immunities?.join(', ') || 'none'}</strong>
-              </div>
-              <div>
-                <span>Vulnerable</span>
-                <strong>{selectedCombatant.vulnerabilities?.join(', ') || 'none'}</strong>
-              </div>
-            </div>
-            <div className="action-list">
-              {selectedCombatant.actions.map((action) => (
-                <article key={action.id} className="action-row">
-                  <div>
-                    <strong>{action.name}</strong>
-                    <p>
-                      {action.kind}
-                      {typeof action.attackBonus === 'number' ? ` · attack ${signed(action.attackBonus)}` : ''}
-                      {typeof action.saveDc === 'number' ? ` · DC ${action.saveDc}` : ''}
-                      {action.damageDice ? ` · ${action.damageDice} ${action.damageType ?? ''}` : ''}
-                      {action.damageOnSave ? ` · pass ${action.damageOnSave === 'half' ? 'half' : 'zero'}` : ''}
-                    </p>
-                  </div>
-                  <span>{action.rangeFt ?? action.reachFt ?? 0} ft</span>
-                </article>
-              ))}
-            </div>
-          </div>
+          <ActionInspector
+            presentation="catalog"
+            combatant={selectedCombatant}
+            combatants={combatants}
+            library={library}
+            scheduledActions={scheduledActions}
+            activeTab={activeInspectorTab}
+            onActiveTabChange={onActiveInspectorTabChange}
+            allowActionEditing={true}
+            onUpdateCombatant={onUpdateCombatant}
+            onUpdateIntent={onUpdateIntent}
+            onAddScheduledAction={onAddScheduledAction}
+            onUpdateScheduledAction={onUpdateScheduledAction}
+            onRemoveScheduledAction={onRemoveScheduledAction}
+            onRemoveCombatant={onRemoveCombatant}
+          />
         ) : (
           <p className="muted-copy">Select a combatant to inspect all configured actions.</p>
         )}
@@ -2733,10 +3425,17 @@ function CombatantManagementPage({
         <ActionInspector
           combatant={selectedCombatant}
           combatants={combatants}
+          library={library}
+          scheduledActions={scheduledActions}
           activeTab={activeInspectorTab}
           onActiveTabChange={onActiveInspectorTabChange}
+          allowActionEditing={false}
+          readOnlyActionNotice="Use the Action Catalog panel to edit action definitions and resources."
           onUpdateCombatant={onUpdateCombatant}
           onUpdateIntent={onUpdateIntent}
+          onAddScheduledAction={onAddScheduledAction}
+          onUpdateScheduledAction={onUpdateScheduledAction}
+          onRemoveScheduledAction={onRemoveScheduledAction}
           onRemoveCombatant={onRemoveCombatant}
         />
       </aside>
@@ -2775,25 +3474,61 @@ function SeedControl({ seed, onChange }: { seed: string; onChange: (seed: string
 
 function RoundControls({
   battle,
+  activeCombatantId,
+  onSelectCombatant,
   onRollInitiative,
   onAutoPlan,
+  onResolveTurn,
   onResolve,
   onResetHp,
   onRemoveDefeated,
 }: {
   battle: BattleState
+  activeCombatantId?: string
+  onSelectCombatant: (id: string) => void
   onRollInitiative: () => void
   onAutoPlan: () => void
+  onResolveTurn: () => void
   onResolve: () => void
   onResetHp: () => void
   onRemoveDefeated: () => void
 }) {
-  const visibleTurns = battle.combatants.slice(0, 7)
-  const selectedTurn = battle.combatants.find((combatant) => combatant.id === battle.selectedCombatantId) ?? battle.combatants[0]
+  const timelineTurns = getBattleTimeline(battle)
+  const visibleTurns = timelineTurns.length
+    ? timelineTurns
+        .filter((item) => item.type === 'turn')
+        .map((item) => battle.combatants.find((combatant) => combatant.id === item.combatantId))
+        .filter((combatant): combatant is Combatant => Boolean(combatant))
+        .slice(0, 7)
+    : battle.combatants.slice(0, 7)
+  const selectedTurnId = activeCombatantId ?? battle.selectedCombatantId
+  const selectedTurn = battle.combatants.find((combatant) => combatant.id === selectedTurnId) ?? battle.combatants[0]
+  const selectedTurnHasNoAction = isNoActionId(primaryActionIdFor(selectedTurn))
   const selectedAction = selectedActionFor(selectedTurn)
   const selectedActionCount = selectedTurn?.intent.actionQueue?.length ?? (selectedTurn ? 1 : 0)
   const timelineRounds = Array.from({ length: Math.max(5, battle.round) }, (_, index) => index + 1)
   const activeRoundRef = useRef<HTMLSpanElement | null>(null)
+  const currentTimelineItem = getCurrentTimelineItem(battle)
+  const timelineActor = currentTimelineItem?.type === 'turn'
+    ? battle.combatants.find((combatant) => combatant.id === currentTimelineItem.combatantId)
+    : currentTimelineItem?.type === 'scheduledAction'
+      ? battle.combatants.find((combatant) => combatant.id === currentTimelineItem.ownerCombatantId)
+      : undefined
+  const timelineInitiative = currentTimelineItem?.initiative ?? selectedTurn?.initiative ?? 0
+  const scheduledTimingLabel =
+    currentTimelineItem?.type === 'scheduledAction'
+      ? currentTimelineItem.timingMode === 'beforeCombatant'
+        ? 'before trigger'
+        : currentTimelineItem.timingMode === 'afterCombatant'
+          ? 'after trigger'
+          : 'at count'
+      : undefined
+  const timelineTriggerLabel = currentTimelineItem?.type === 'turn'
+    ? timelineActor?.name ?? 'Unknown'
+    : currentTimelineItem?.type === 'scheduledAction'
+      ? `${timelineActor?.name ?? 'Unknown'} ${scheduledTimingLabel}`
+      : 'No timeline item'
+  const timelineTypeLabel = currentTimelineItem?.type === 'scheduledAction' ? 'Scheduled Action' : 'Turn'
 
   useEffect(() => {
     activeRoundRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
@@ -2815,14 +3550,17 @@ function RoundControls({
 
       <div className="initiative-strip" aria-label="Round order">
         {visibleTurns.map((combatant) => (
-          <span
+          <button
+            type="button"
             key={combatant.id}
-            className={`turn-chip ${combatant.id === battle.selectedCombatantId ? 'active' : ''}`}
+            className={`turn-chip ${combatant.side === 'Heroes' ? 'heroes' : 'monsters'} ${combatant.id === selectedTurnId ? 'active' : ''}`}
+            onClick={() => onSelectCombatant(combatant.id)}
+            aria-pressed={combatant.id === selectedTurnId}
             title={combatant.name}
           >
             <strong>{combatant.initiative ?? '-'}</strong>
             <em className="turn-name">{combatant.name}</em>
-          </span>
+          </button>
         ))}
         <button type="button" className="icon-button ghost" aria-label="More turns">
           <MoreVertical size={17} />
@@ -2836,38 +3574,51 @@ function RoundControls({
           <small>+{Math.max(0, selectedTurn?.initiativeBonus ?? 0)}</small>
         </div>
         <div className="damage-expression">
-          <span>{selectedActionCount > 1 ? 'Actions' : 'Damage'}</span>
-          <strong>{selectedActionCount > 1 ? selectedActionCount : selectedAction?.damageDice ?? '1d8'} </strong>
-          <small>{selectedActionCount > 1 ? 'planned' : selectedAction?.damageType ?? 'Piercing'}</small>
+          <span>{selectedTurnHasNoAction ? 'Action' : selectedActionCount > 1 ? 'Actions' : 'Damage'}</span>
+          <strong>{selectedTurnHasNoAction ? 'None' : selectedActionCount > 1 ? selectedActionCount : selectedAction?.damageDice ?? '1d8'} </strong>
+          <small>{selectedTurnHasNoAction ? 'planned' : selectedActionCount > 1 ? 'planned' : selectedAction?.damageType ?? 'Piercing'}</small>
         </div>
         <div className="range-expression">
-          <span>{selectedAction?.kind === 'save' ? 'Save' : 'Attack'}</span>
+          <span>{selectedTurnHasNoAction ? 'Turn' : selectedAction?.kind === 'save' ? 'Save' : 'Attack'}</span>
           <strong>
-            {selectedAction?.kind === 'save'
+            {selectedTurnHasNoAction
+              ? noActionLabel
+              : selectedAction?.kind === 'save'
               ? `DC ${selectedAction.saveDc ?? '-'}`
               : `${selectedAction?.rangeFt ?? selectedAction?.reachFt ?? 5} ft`}
           </strong>
         </div>
+        <div className="initiative-round-window">
+          <span>Current Initiative</span>
+          <strong>{timelineInitiative}</strong>
+          <small>
+            {timelineTypeLabel}: {timelineTriggerLabel}
+          </small>
+        </div>
         <div className="round-button-row">
-          <button type="button" onClick={onRollInitiative}>
+          <button type="button" onClick={onRollInitiative} aria-label="Roll initiative" title="Roll initiative">
             <Gauge size={17} />
-            Initiative
+            Init
           </button>
-          <button type="button" onClick={onAutoPlan}>
+          <button type="button" onClick={onAutoPlan} aria-label="Auto plan strategy" title="Auto plan strategy">
             <Bot size={17} />
-            Strategy
+            Plan
           </button>
-          <button type="button" className="primary" onClick={onResolve} disabled={!battle.combatants.length}>
+          <button type="button" onClick={onResolveTurn} disabled={!battle.combatants.length} aria-label="Resolve current turn" title="Resolve current turn">
             <Play size={17} />
-            Run Round
+            Turn
           </button>
-          <button type="button" onClick={onResetHp}>
+          <button type="button" className="primary" onClick={onResolve} disabled={!battle.combatants.length} aria-label="Run round" title="Run round">
+            <Play size={17} />
+            Round
+          </button>
+          <button type="button" onClick={onResetHp} aria-label="Long rest" title="Long rest">
             <HeartPulse size={17} />
-            Long Rest
+            Rest
           </button>
-          <button type="button" onClick={onRemoveDefeated}>
+          <button type="button" onClick={onRemoveDefeated} aria-label="Clear defeated combatants" title="Clear defeated combatants">
             <Archive size={17} />
-            Clear Defeated
+            Clear
           </button>
         </div>
       </div>
@@ -5154,21 +5905,37 @@ function Roster({
 }
 
 function ActionInspector({
+  presentation = 'inspector',
   combatant,
   combatants,
+  library,
   activeTab,
   onActiveTabChange,
+  allowActionEditing,
+  readOnlyActionNotice,
   onUpdateCombatant,
   onUpdateIntent,
   onRemoveCombatant,
+  scheduledActions,
+  onAddScheduledAction,
+  onUpdateScheduledAction,
+  onRemoveScheduledAction,
 }: {
+  presentation?: 'inspector' | 'catalog'
   combatant?: Combatant
   combatants: Combatant[]
+  library: ContentEntry[]
   activeTab: InspectorTab
   onActiveTabChange: (tab: InspectorTab) => void
+  allowActionEditing: boolean
+  readOnlyActionNotice?: string
   onUpdateCombatant: (id: string, patch: Partial<Combatant>) => void
   onUpdateIntent: (id: string, patch: Partial<ActionIntent>) => void
   onRemoveCombatant: (id: string) => void
+  scheduledActions: ScheduledAction[]
+  onAddScheduledAction: (ownerId: string, action: Partial<ScheduledAction>) => void
+  onUpdateScheduledAction: (id: string, patch: Partial<ScheduledAction>) => void
+  onRemoveScheduledAction: (id: string) => void
 }) {
   const [selectedConditionName, setSelectedConditionName] = useState<string>(srdConditions[0].name)
   const [conditionDuration, setConditionDuration] = useState('')
@@ -5179,6 +5946,15 @@ function ActionInspector({
   const [effectDuration, setEffectDuration] = useState('')
   const [effectSource, setEffectSource] = useState('')
   const [effectDescription, setEffectDescription] = useState('')
+  const [libraryActionEntryId, setLibraryActionEntryId] = useState('')
+  const [libraryActionId, setLibraryActionId] = useState('')
+  const [customActionName, setCustomActionName] = useState('')
+  const [customEffectLabel, setCustomEffectLabel] = useState('')
+  const [customEffectDescription, setCustomEffectDescription] = useState('')
+  const [newResourceLabel, setNewResourceLabel] = useState('')
+  const [newResourceMax, setNewResourceMax] = useState('1')
+  const [newResourceRecovery, setNewResourceRecovery] = useState<ResourceDefinition['recovery']>('manual')
+  const [newResourceRechargeMin, setNewResourceRechargeMin] = useState('6')
 
   if (!combatant) {
     return (
@@ -5190,15 +5966,18 @@ function ActionInspector({
   }
 
   const targetOptions = combatants
+  const primaryActionHasNoAction = isNoActionId(primaryActionIdFor(combatant))
   const selectedAction = selectedActionFor(combatant)
-  const fallbackActionId = selectedAction?.id ?? combatant.actions[0]?.id ?? 'manual'
+  const availableActionIds = new Set([...combatant.actions.map((action) => action.id), noActionId])
+  const fallbackActionId = primaryActionHasNoAction ? noActionId : selectedAction?.id ?? combatant.actions[0]?.id ?? noActionId
   const plannedActions: PlannedActionIntent[] = combatant.intent.actionQueue?.length
     ? combatant.intent.actionQueue.map((plannedAction, index) => ({
         id: plannedAction.id ?? `planned-action-${index}`,
-        actionId: combatant.actions.some((action) => action.id === plannedAction.actionId)
+        actionId: availableActionIds.has(plannedAction.actionId)
           ? plannedAction.actionId
           : fallbackActionId,
         targetId: plannedAction.targetId,
+        healingAmount: plannedAction.healingAmount,
       }))
     : [
         {
@@ -5208,7 +5987,10 @@ function ActionInspector({
         },
       ]
   const plannedActionDetails = plannedActions.map(
-    (plannedAction) => combatant.actions.find((action) => action.id === plannedAction.actionId) ?? selectedAction,
+    (plannedAction) =>
+      isNoActionId(plannedAction.actionId)
+        ? undefined
+        : combatant.actions.find((action) => action.id === plannedAction.actionId) ?? selectedAction,
   )
   const plannedDestination = combatant.intent.destination ?? combatant.position
   const plannedMoveFt = gridDistanceFt(combatant.position, plannedDestination)
@@ -5216,6 +5998,13 @@ function ActionInspector({
   const overMoveBudgetFt = Math.max(0, plannedMoveFt - combatant.speedFt)
   const conditions = combatant.conditions ?? []
   const activeEffects = combatant.activeEffects ?? []
+  const availableActionLibraryEntries = library.filter((entry) => entry.actions.length > 0)
+  const selectedLibraryEntry = availableActionLibraryEntries.find((entry) => entry.id === libraryActionEntryId) ??
+    availableActionLibraryEntries[0]
+  const selectedLibraryActions = selectedLibraryEntry?.actions ?? []
+  const selectedLibraryAction = selectedLibraryActions.find((action) => action.id === libraryActionId) ?? selectedLibraryActions[0]
+  const resourceRecoverySummary = summarizeResourceRecoveries(combatant.resources)
+  const allResourcesFull = combatant.resources.every((resource) => resource.current >= resource.max)
   const rollAdjustment = (key: RollKey): RollAdjustment => ({
     modifier: combatant.intent.rollAdjustments?.[key]?.modifier ?? 0,
     advantage: combatant.intent.rollAdjustments?.[key]?.advantage ?? false,
@@ -5234,12 +6023,19 @@ function ActionInspector({
   }
   const proficiencyBonus = combatantProficiencyBonus(combatant)
   const updateRollBonus = (key: RollProfileKey, patch: Partial<RollBonusConfig>) => {
+    const current = rollBonusConfig(combatant, key)
+    const nextPatch = {
+      ...patch,
+      expertise: patch.proficient === false ? false : patch.expertise ?? current.expertise,
+      proficient: patch.expertise === true ? true : patch.proficient ?? current.proficient,
+    }
+
     onUpdateCombatant(combatant.id, {
       rollBonuses: {
         ...combatant.rollBonuses,
         [key]: {
-          ...rollBonusConfig(combatant, key),
-          ...patch,
+          ...current,
+          ...nextPatch,
         },
       },
     })
@@ -5262,6 +6058,258 @@ function ActionInspector({
 
     onUpdateCombatant(combatant.id, {
       saveProficiencies: abilities.filter((candidate) => current.has(candidate)),
+      rollBonuses: proficient
+        ? combatant.rollBonuses
+        : {
+            ...combatant.rollBonuses,
+            [`${ability}Save`]: {
+              ...rollBonusConfig(combatant, `${ability}Save` as RollProfileKey),
+              expertise: false,
+            },
+          },
+    })
+  }
+
+  const updateAction = (actionId: string, patch: Partial<ActionDefinition>) => {
+    onUpdateCombatant(combatant.id, {
+      actions: combatant.actions.map((action) => (action.id === actionId ? { ...action, ...patch } : action)),
+    })
+  }
+
+  const addBlankAction = (base?: ActionDefinition) => {
+    const defaults: ActionDefinition = {
+      id: createActionId('custom'),
+      name: customActionName.trim() || `${combatant.name} action`,
+      kind: 'manual' as const,
+      target: 'enemy' as const,
+      tags: ['custom'],
+      description: '',
+      rangeFt: 30,
+      reachFt: 5,
+      attackBonus: 0,
+      saveDc: 10,
+      saveAbility: inferCombatantSpellAbility(combatant),
+      damageType: 'bludgeoning',
+      damageDice: '1d4',
+      healingDice: '1d8',
+      spellLevel: 1,
+      damageOnSave: 'none' as const,
+      damageApplication: 'immediate' as const,
+      damageTrigger: 'hit' as const,
+      damageAppliesTo: 'damage' as const,
+    }
+    const nextAction: ActionDefinition = base
+      ? { ...base, id: createActionId('action') }
+      : { ...defaults }
+    const actionToAdd: ActionDefinition = {
+      ...defaults,
+      ...nextAction,
+      id: nextAction.id,
+      effects: nextAction.effects?.length ? nextAction.effects : [],
+      secondaryDamage: nextAction.secondaryDamage?.length ? nextAction.secondaryDamage : [],
+    }
+
+    onUpdateCombatant(combatant.id, {
+      actions: [...combatant.actions, actionToAdd],
+    })
+    setCustomActionName('')
+  }
+
+  const duplicateAction = (actionId: string) => {
+    const action = combatant.actions.find((candidate) => candidate.id === actionId)
+    if (!action) {
+      return
+    }
+
+    addBlankAction({
+      ...cloneCombatantAction(action),
+      name: `${action.name} Copy`,
+      id: createActionId('action'),
+    })
+  }
+
+  const removeAction = (actionId: string) => {
+    if (combatant.actions.length <= 1) {
+      return
+    }
+
+    onUpdateCombatant(combatant.id, {
+      actions: combatant.actions.filter((action) => action.id !== actionId),
+    })
+  }
+
+  const importAction = () => {
+    if (!selectedLibraryAction) {
+      return
+    }
+
+    addBlankAction(selectedLibraryAction)
+  }
+
+  const updateActionEffect = (actionId: string, effectId: string, patch: Partial<EffectDefinition>) => {
+    onUpdateCombatant(combatant.id, {
+      actions: combatant.actions.map((action) =>
+        action.id === actionId
+          ? {
+              ...action,
+              effects: (action.effects ?? []).map((effect) => (effect.id === effectId ? { ...effect, ...patch } : effect)),
+            }
+          : action,
+      ),
+    })
+  }
+
+  const addActionEffect = (actionId: string) => {
+    if (!customEffectLabel.trim()) {
+      return
+    }
+
+    onUpdateCombatant(combatant.id, {
+      actions: combatant.actions.map((action) =>
+        action.id === actionId
+          ? {
+              ...action,
+              effects: [
+                ...(action.effects ?? []),
+                {
+                  id: createStatusId('effect'),
+                  label: customEffectLabel.trim(),
+                  description: customEffectDescription.trim(),
+                },
+              ],
+            }
+          : action,
+      ),
+    })
+    setCustomEffectLabel('')
+    setCustomEffectDescription('')
+  }
+
+  const removeActionEffect = (actionId: string, effectId: string) => {
+    onUpdateCombatant(combatant.id, {
+      actions: combatant.actions.map((action) =>
+        action.id === actionId
+          ? {
+              ...action,
+              effects: (action.effects ?? []).filter((effect) => effect.id !== effectId),
+            }
+          : action,
+      ),
+    })
+  }
+
+  const updateActionResourceCost = (
+    actionId: string,
+    patch: {
+      amount?: number
+      resourceId?: string | null
+      resourceLabel?: string | null
+    },
+  ) => {
+    onUpdateCombatant(combatant.id, {
+      actions: combatant.actions.map((action) =>
+        action.id === actionId
+          ? {
+              ...action,
+              resourceCost: (() => {
+                const nextAmount =
+                  'amount' in patch ? patch.amount : action.resourceCost?.amount ?? 0
+                const hasCost = nextAmount > 0
+                if (!hasCost) {
+                  return undefined
+                }
+
+                const nextCost = {
+                  ...(action.resourceCost ?? {}),
+                  amount: nextAmount,
+                }
+
+                if ('resourceId' in patch) {
+                  if (patch.resourceId) {
+                    nextCost.resourceId = patch.resourceId
+                  } else {
+                    delete nextCost.resourceId
+                  }
+                }
+
+                if ('resourceLabel' in patch) {
+                  if (patch.resourceLabel) {
+                    nextCost.resourceLabel = patch.resourceLabel
+                  } else {
+                    delete nextCost.resourceLabel
+                  }
+                }
+
+                return nextCost
+              })(),
+            }
+          : action,
+      ),
+    })
+  }
+
+  const updateResource = (
+    id: string,
+    patch: Partial<Pick<ResourceDefinition, 'label' | 'max' | 'current' | 'recovery' | 'rechargeMin'>>,
+  ) => {
+    onUpdateCombatant(combatant.id, {
+      resources: combatant.resources.map((resource) => {
+        if (resource.id !== id) {
+          return resource
+        }
+
+        const nextResource = {
+          ...resource,
+          ...patch,
+          rechargeMin: (patch.recovery ?? resource.recovery) === 'recharge'
+            ? clampRechargeMin(patch.rechargeMin ?? resource.rechargeMin)
+            : undefined,
+        }
+
+        if ('max' in patch) {
+          const nextMax = Math.max(0, Math.round(nextResource.max))
+          return {
+            ...nextResource,
+            max: nextMax,
+            current: clampResourceCurrent({ ...nextResource, max: nextMax }, nextResource.current),
+          }
+        }
+
+        return {
+          ...nextResource,
+          current: 'current' in patch
+            ? clampResourceCurrent(nextResource, nextResource.current)
+            : nextResource.current,
+        }
+      }),
+    })
+  }
+
+  const addResource = () => {
+    const label = newResourceLabel.trim() || 'Resource'
+    const max = Math.max(0, numberValue(newResourceMax))
+    onUpdateCombatant(combatant.id, {
+      resources: [
+        ...combatant.resources,
+        {
+          id: createResourceId(),
+          label,
+          max,
+          current: max,
+          recovery: newResourceRecovery,
+          rechargeMin: newResourceRecovery === 'recharge' ? clampRechargeMin(numberValue(newResourceRechargeMin)) : undefined,
+        },
+      ],
+    })
+    setNewResourceLabel('')
+    setNewResourceMax('1')
+    setNewResourceRecovery('manual')
+    setNewResourceRechargeMin('6')
+  }
+
+  const removeResource = (id: string) => {
+    onUpdateCombatant(combatant.id, {
+      resources: combatant.resources.filter((resource) => resource.id !== id),
     })
   }
   const updateCondition = (id: string, patch: Partial<CombatantCondition>) => {
@@ -5272,6 +6320,14 @@ function ActionInspector({
   const removeCondition = (id: string) => {
     onUpdateCombatant(combatant.id, {
       conditions: conditions.filter((condition) => condition.id !== id),
+    })
+  }
+  const restoreAllResources = () => {
+    onUpdateCombatant(combatant.id, {
+      resources: combatant.resources.map((resource) => ({
+        ...resource,
+        current: resource.max,
+      })),
     })
   }
   const addSrdCondition = () => {
@@ -5357,12 +6413,28 @@ function ActionInspector({
   }
   const updateActionQueue = (nextQueue: PlannedActionIntent[]) => {
     const normalizedQueue = nextQueue.length
-      ? nextQueue
-      : [{ id: createStatusId('planned-action'), actionId: fallbackActionId, targetId: combatant.intent.targetId }]
+      ? nextQueue.map((plannedAction) => {
+          const action = combatant.actions.find((candidate) => candidate.id === plannedAction.actionId)
+          return {
+            ...plannedAction,
+            targetId: action?.kind === 'heal' && !plannedAction.targetId ? combatant.id : plannedAction.targetId,
+            healingAmount: supportsChosenHealingAmount(action) ? plannedAction.healingAmount : undefined,
+          }
+        })
+      : [
+          {
+            id: createStatusId('planned-action'),
+            actionId: fallbackActionId,
+            targetId: defaultTargetIdForAction(combatant, fallbackActionId) ?? combatant.intent.targetId,
+          },
+        ]
 
     onUpdateIntent(combatant.id, {
       actionId: normalizedQueue[0]?.actionId ?? fallbackActionId,
-      targetId: normalizedQueue[0]?.targetId,
+      targetId:
+        normalizedQueue[0]?.targetId ??
+        defaultTargetIdForAction(combatant, normalizedQueue[0]?.actionId ?? fallbackActionId) ??
+        combatant.intent.targetId,
       actionQueue: normalizedQueue,
     })
   }
@@ -5390,119 +6462,898 @@ function ActionInspector({
 
     updateActionQueue(plannedActions.filter((_, plannedIndex) => plannedIndex !== index))
   }
+  const ownerScheduledActions = scheduledActions.filter((scheduledAction) => scheduledAction.ownerCombatantId === combatant.id)
+  const triggerCombatantOptions = combatants
+  const addScheduledActionRow = () => {
+    onAddScheduledAction(combatant.id, {
+      actionId: combatant.actions[0]?.id ?? noActionId,
+      timingMode: 'initiativeCount',
+      initiativeCount: combatant.initiative ?? 0,
+      targetId: combatant.actions[0]?.kind === 'heal' ? combatant.id : combatant.intent.targetId,
+    })
+  }
+  const updateScheduledActionRow = (id: string, patch: Partial<ScheduledAction>) => {
+    onUpdateScheduledAction(id, patch)
+  }
+  const renderScheduledActionPreview = (scheduledAction: ScheduledAction) => {
+    const action = combatant.actions.find((candidate) => candidate.id === scheduledAction.actionId)
+    if (!action || isNoActionId(scheduledAction.actionId)) {
+      return scheduledAction.timingMode === 'initiativeCount'
+        ? `No scheduled action at initiative ${scheduledAction.initiativeCount ?? 0}.`
+        : `No scheduled action ${scheduledAction.timingMode === 'beforeCombatant' ? 'before' : 'after'} turn trigger.`
+    }
+
+    const triggerCombatant = combatants.find((combatant) => combatant.id === scheduledAction.triggerCombatantId)
+    const triggerLabel = triggerCombatant ? triggerCombatant.name : 'Unknown combatant'
+    const timingText =
+      scheduledAction.timingMode === 'initiativeCount'
+        ? `Before initiative ${scheduledAction.initiativeCount ?? 0}`
+        : `${scheduledAction.timingMode === 'beforeCombatant' ? 'Before' : 'After'} ${triggerLabel}`
+
+    return (
+      <>
+        <span className="action-preview-badge">{scheduledAction.timingMode}</span>
+        <span>{timingText}</span>
+        <span> · {action.name}</span>
+        {action.damageDice ? <span className="action-preview-badge">{action.damageDice}</span> : null}
+        <span className="action-preview-source">Source: {actionSourceLabel(action, combatant)}</span>
+      </>
+    )
+  }
+  const scheduledActionHasHealingAmount = (scheduledAction: ScheduledAction) => {
+    const action = combatant.actions.find((candidate) => candidate.id === scheduledAction.actionId)
+    return supportsChosenHealingAmount(action)
+  }
+  const damagePreviewFor = (action?: ActionDefinition) =>
+    action?.damageDice
+      ? damageWithModifier(action.damageDice, rollAdjustment('damage').modifier + rollBonusTotal(combatant, 'damage'))
+      : undefined
+  const modifierTargetIndexFor = (modifierIndex: number, modifierAction: ActionDefinition | undefined) => {
+    const previousIndex = plannedActionDetails.findLastIndex(
+      (candidate, candidateIndex) =>
+        candidateIndex < modifierIndex && actionSupportsDamageModifier(candidate, modifierAction),
+    )
+    if (previousIndex >= 0) {
+      return previousIndex
+    }
+
+    const nextIndex = plannedActionDetails.findIndex(
+      (candidate, candidateIndex) =>
+        candidateIndex > modifierIndex && actionSupportsDamageModifier(candidate, modifierAction),
+    )
+
+    return nextIndex >= 0 ? nextIndex : undefined
+  }
+  const plannedModifierTargets = plannedActionDetails.map((action, index) =>
+    isDamageModifierAction(action) ? modifierTargetIndexFor(index, action) : undefined,
+  )
+  const attachedModifiersFor = (index: number) =>
+    plannedActionDetails
+      .map((action, modifierIndex) => ({ action, modifierIndex }))
+      .filter(
+        (entry): entry is { action: ActionDefinition; modifierIndex: number } =>
+          plannedModifierTargets[entry.modifierIndex] === index && Boolean(entry.action),
+      )
+  const renderSecondaryDamage = (damage: SecondaryDamageDefinition) => (
+    <span key={damage.id} className="action-preview-badge conditional">
+      + {damage.damageDice} {damage.damageType ?? 'damage'}
+      {damage.condition ? ` if ${damage.condition}` : ''}
+    </span>
+  )
+  const renderResourceCostBadge = (action: ActionDefinition | undefined) => {
+    const availability = actionResourceAvailability(combatant, action)
+    if (!availability.cost) {
+      return null
+    }
+
+    const costLabel = resourceCostLabel(availability.cost)
+    const badgeText = availability.available
+      ? `cost ${costLabel}`
+      : availability.resource
+        ? `needs ${costLabel} (${availability.resource.current}/${availability.resource.max})`
+        : `missing ${costLabel}`
+
+    return (
+      <span className={`action-preview-badge cost ${availability.available ? '' : 'warning'}`}>
+        {badgeText}
+      </span>
+    )
+  }
+  const renderPlannedActionPreview = (
+    action: ActionDefinition | undefined,
+    plannedAction: PlannedActionIntent,
+    index: number,
+  ) => {
+    if (isNoActionId(plannedAction.actionId)) {
+      return 'No action will be taken.'
+    }
+
+    const source = actionSourceLabel(action, combatant)
+    const damagePreview = damagePreviewFor(action)
+    if (isDamageModifierAction(action)) {
+      const targetIndex = plannedModifierTargets[index]
+      const targetAction = typeof targetIndex === 'number' ? plannedActionDetails[targetIndex] : undefined
+      return (
+        <>
+          <span className="action-preview-badge">modifier</span>
+          {damagePreview ? (
+            <span className="action-preview-badge modifier">
+              + {damagePreview} {action?.damageType ?? 'damage'}
+            </span>
+          ) : null}
+          {action?.secondaryDamage?.map(renderSecondaryDamage)}
+          {renderResourceCostBadge(action)}
+          {targetAction ? ` modifies #${(targetIndex ?? 0) + 1} ${targetAction.name}` : ' no compatible weapon hit planned'}
+          <span className="action-preview-source">Source: {source}</span>
+        </>
+      )
+    }
+
+    return (
+      <>
+        {action?.kind ?? 'manual'}
+        {typeof action?.attackBonus === 'number'
+          ? ` · ${signed(action.attackBonus + rollAdjustment('attack').modifier + rollBonusTotal(combatant, 'attack'))} to hit`
+          : ''}
+        {typeof action?.saveDc === 'number' ? ` · DC ${action.saveDc + rollBonusTotal(combatant, 'saveDc')}` : ''}
+        {damagePreview ? ` · ${damagePreview} ${action?.damageType ?? ''}` : ''}
+        {attachedModifiersFor(index).map(({ action: modifier }) => (
+          <span key={modifier.id} className="action-preview-badge modifier">
+            + {damagePreviewFor(modifier)} {modifier.damageType ?? 'damage'} from {modifier.name}
+          </span>
+        ))}
+        {attachedModifiersFor(index).flatMap(({ action: modifier }) => modifier.secondaryDamage?.map(renderSecondaryDamage) ?? [])}
+        {renderResourceCostBadge(action)}
+        <span className="action-preview-source">Source: {source}</span>
+      </>
+    )
+  }
   const inspectorTabs: Array<{ id: InspectorTab; label: string; count?: number }> = [
     { id: 'actions', label: 'Actions', count: combatant.actions.length },
     { id: 'details', label: 'Details' },
     { id: 'conditions', label: 'Conditions', count: conditions.length },
     { id: 'effects', label: 'Effects', count: activeEffects.length },
   ]
-  const renderActionsTab = () => (
-    <>
-      <div className="action-stack">
-        <article className={`action-card move-card ${overMoveBudget ? 'over-budget' : ''}`}>
-          <Move size={21} />
-          <div>
-            <strong>Move</strong>
-            <p>
-              {plannedMoveFt} / {combatant.speedFt} ft · 5-10-5 diagonal
-              {overMoveBudget ? ` · ${overMoveBudgetFt} ft over allowed movement` : ''}
-            </p>
-          </div>
-          <input
-            type="number"
-            value={combatant.intent.destination?.x ?? combatant.position.x}
-            onChange={(event) =>
-              onUpdateIntent(combatant.id, {
-                destination: {
-                  x: numberValue(event.target.value),
-                  y: combatant.intent.destination?.y ?? combatant.position.y,
-                },
-              })
-            }
-          />
-        </article>
-        <article className="action-card">
-          <Swords size={22} />
-          <div>
-            <strong>
-              {selectedAction?.name ?? 'Manual Ruling'}
-              {plannedActions.length > 1 ? ` + ${plannedActions.length - 1} more` : ''}
-            </strong>
-            <p>
-              {selectedAction?.kind ?? 'manual'}
-              {typeof selectedAction?.attackBonus === 'number' ? ` · ${signed(selectedAction.attackBonus)} to hit` : ''}
-              {typeof selectedAction?.saveDc === 'number' ? ` · DC ${selectedAction.saveDc}` : ''}
-              {selectedAction?.effects?.length ? ` · ${selectedAction.effects.length} effects` : ''}
-            </p>
-          </div>
-          <button type="button" className="icon-button ghost" aria-label="Targeting">
-            <Target size={18} />
-          </button>
-        </article>
+  const renderConfiguredActionsReadOnly = () => (
+    <section className="builder-section">
+      <div className="builder-section-title">
+        <h3>Configured actions</h3>
+        <span>{combatant.actions.length} total</span>
       </div>
+      <div className="action-list">
+        {combatant.actions.map((action) => (
+          <article key={action.id} className="action-row">
+            <div>
+              <strong>{action.name || `${combatant.name} action`}</strong>
+              <p>
+                {action.kind}
+                {typeof action.attackBonus === 'number' ? ` · attack ${signed(action.attackBonus)}` : ''}
+                {typeof action.saveDc === 'number' ? ` · DC ${action.saveDc}` : ''}
+                {action.damageDice ? ` · ${action.damageDice} ${action.damageType ?? ''}` : ''}
+                {action.damageOnSave ? ` · pass ${action.damageOnSave === 'half' ? 'half' : 'zero'}` : ''}
+                {action.effects?.length ? ` · ${action.effects.length} effects` : ''}
+              </p>
+            </div>
+            <span>{action.rangeFt ?? action.reachFt ?? 0} ft</span>
+          </article>
+        ))}
+      </div>
+      <p className="muted-copy">
+        {readOnlyActionNotice ?? 'Action definition edits and library imports are available only in Combatant Management.'}
+      </p>
+    </section>
+  )
+  const renderActionsTab = ({
+    showTurnControls = true,
+    showDefinitionControls = true,
+  }: {
+    showTurnControls?: boolean
+    showDefinitionControls?: boolean
+  } = {}) => {
+    const actionCostResourceId = (action: ActionDefinition) =>
+      action.resourceCost?.resourceId ||
+      combatant.resources.find(
+        (resource) => resource.label === action.resourceCost?.resourceLabel ||
+          (action.resourceCost?.resourceId && resource.label.toLowerCase() === action.resourceCost.resourceId.toLowerCase()),
+      )?.id ||
+      ''
 
-      <Field label="Strategy">
-        <select value={combatant.strategy} onChange={(event) => onUpdateCombatant(combatant.id, { strategy: event.target.value as Strategy })}>
-          {strategies.map((strategy) => (
-            <option key={strategy} value={strategy}>
-              {strategy}
-            </option>
-          ))}
-        </select>
-      </Field>
-
-      <section className="planned-action-panel">
-        <div className="builder-section-title">
-          <h3>Planned actions</h3>
-          <span>{plannedActions.length} this round</span>
-        </div>
-        <div className="planned-action-list">
-          {plannedActions.map((plannedAction, index) => {
-            const action = plannedActionDetails[index]
-            return (
-              <article key={plannedAction.id} className="planned-action-row">
-                <div className="planned-action-index">{index + 1}</div>
-                <Field label="Action">
-                  <select value={plannedAction.actionId} onChange={(event) => updatePlannedAction(index, { actionId: event.target.value })}>
-                    {combatant.actions.map((candidate) => (
-                      <option key={candidate.id} value={candidate.id}>
-                        {candidate.name} · {candidate.kind}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-                <Field label="Target">
-                  <select value={plannedAction.targetId ?? ''} onChange={(event) => updatePlannedAction(index, { targetId: event.target.value || undefined })}>
-                    <option value="">Auto target</option>
-                    {targetOptions.map((target) => (
-                      <option key={target.id} value={target.id}>
-                        {target.name} · {target.side}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-                <button
-                  type="button"
-                  className="icon-button ghost"
-                  aria-label={`Remove action ${index + 1}`}
-                  disabled={plannedActions.length <= 1}
-                  onClick={() => removePlannedAction(index)}
-                >
-                  -
-                </button>
-                <p>
-                  {action?.kind ?? 'manual'}
-                  {typeof action?.attackBonus === 'number' ? ` · ${signed(action.attackBonus)} to hit` : ''}
-                  {typeof action?.saveDc === 'number' ? ` · DC ${action.saveDc}` : ''}
-                  {action?.damageDice ? ` · ${action.damageDice}` : ''}
-                </p>
+    return (
+      <>
+        {showTurnControls ? (
+          <>
+            <div className="action-stack">
+              <article className={`action-card move-card ${overMoveBudget ? 'over-budget' : ''}`}>
+                <Move size={21} />
+                <div>
+                  <strong>Move</strong>
+                  <p>
+                    {plannedMoveFt} / {combatant.speedFt} ft · 5-10-5 diagonal
+                    {overMoveBudget ? ` · ${overMoveBudgetFt} ft over allowed movement` : ''}
+                  </p>
+                </div>
+                <input
+                  type="number"
+                  value={combatant.intent.destination?.x ?? combatant.position.x}
+                  onChange={(event) =>
+                    onUpdateIntent(combatant.id, {
+                      destination: {
+                        x: numberValue(event.target.value),
+                        y: combatant.intent.destination?.y ?? combatant.position.y,
+                      },
+                    })
+                  }
+                />
               </article>
-            )
-          })}
+              <article className="action-card">
+                <Swords size={22} />
+                <div>
+                  <strong>
+                    {primaryActionHasNoAction ? noActionLabel : selectedAction?.name ?? 'Manual Ruling'}
+                    {plannedActions.length > 1 ? ` + ${plannedActions.length - 1} more` : ''}
+                  </strong>
+                  <p>
+                    {primaryActionHasNoAction ? 'skip turn action' : selectedAction?.kind ?? 'manual'}
+                    {!primaryActionHasNoAction && typeof selectedAction?.attackBonus === 'number' ? ` · ${signed(selectedAction.attackBonus)} to hit` : ''}
+                    {!primaryActionHasNoAction && typeof selectedAction?.saveDc === 'number' ? ` · DC ${selectedAction.saveDc}` : ''}
+                    {!primaryActionHasNoAction && selectedAction?.effects?.length ? ` · ${selectedAction.effects.length} effects` : ''}
+                  </p>
+                </div>
+                <button type="button" className="icon-button ghost" aria-label="Targeting">
+                  <Target size={18} />
+                </button>
+              </article>
+            </div>
+
+            <Field label="Strategy">
+              <select value={combatant.strategy} onChange={(event) => onUpdateCombatant(combatant.id, { strategy: event.target.value as Strategy })}>
+                {strategies.map((strategy) => (
+                  <option key={strategy} value={strategy}>
+                    {strategy}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          </>
+        ) : null}
+
+        {showDefinitionControls ? (
+        <section className="builder-section">
+          <div className="builder-section-title">
+            <h3>Configured actions</h3>
+            <span>{combatant.actions.length} total</span>
+          </div>
+          {allowActionEditing ? (
+            <>
+              <div className="configured-action-list">
+                {combatant.actions.map((action) => {
+                  const actionCost = action.resourceCost
+                  const selectedResourceId = actionCostResourceId(action)
+                  return (
+                    <article key={action.id} className="configured-action-card">
+                      <div className="action-editor-header">
+                        <strong>{action.name || `${combatant.name} action`}</strong>
+                        <div className="action-editor-buttons">
+                          <button type="button" className="small-button" onClick={() => duplicateAction(action.id)}>
+                            <Plus size={14} />
+                            Duplicate
+                          </button>
+                          <button
+                            type="button"
+                            className="small-button danger"
+                            disabled={combatant.actions.length <= 1}
+                            onClick={() => removeAction(action.id)}
+                          >
+                            <Minus size={14} />
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+                      <div className="form-grid two">
+                        <Field label="Action name">
+                          <input
+                            value={action.name}
+                            onChange={(event) => updateAction(action.id, { name: event.target.value })}
+                          />
+                        </Field>
+                        <Field label="Kind">
+                          <select
+                            value={action.kind}
+                            onChange={(event) => updateAction(action.id, { kind: event.target.value as ActionDefinition['kind'] })}
+                          >
+                            {actionKinds.map((kind) => (
+                              <option key={kind} value={kind}>
+                                {kind}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                        <Field label="Target">
+                          <select
+                            value={action.target}
+                            onChange={(event) => updateAction(action.id, { target: event.target.value as ActionDefinition['target'] })}
+                          >
+                            {targetKinds.map((target) => (
+                              <option key={target} value={target}>
+                                {target}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                        <Field label="Attack bonus">
+                          <input
+                            type="number"
+                            value={typeof action.attackBonus === 'number' ? action.attackBonus : ''}
+                            disabled={action.kind !== 'attack'}
+                            onChange={(event) =>
+                              updateAction(action.id, {
+                                attackBonus: event.target.value ? numberValue(event.target.value) : undefined,
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field label="Save DC">
+                          <input
+                            type="number"
+                            value={typeof action.saveDc === 'number' ? action.saveDc : ''}
+                            disabled={action.kind !== 'save'}
+                            onChange={(event) =>
+                              updateAction(action.id, {
+                                saveDc: event.target.value ? numberValue(event.target.value) : undefined,
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field label="Save ability">
+                          <select
+                            value={action.saveAbility ?? inferCombatantSpellAbility(combatant)}
+                            disabled={action.kind !== 'save'}
+                            onChange={(event) => updateAction(action.id, { saveAbility: event.target.value as Ability })}
+                          >
+                            {abilities.map((ability) => (
+                              <option key={ability} value={ability}>
+                                {ability.toUpperCase()}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                        <Field label={action.kind === 'heal' ? 'Healing dice' : 'Damage dice'}>
+                          <input
+                            value={action.kind === 'heal' ? action.healingDice ?? '' : action.damageDice ?? ''}
+                            onChange={(event) => {
+                              const value = event.target.value
+                              if (action.kind === 'heal') {
+                                updateAction(action.id, { healingDice: value })
+                              } else {
+                                updateAction(action.id, { damageDice: value })
+                              }
+                            }}
+                          />
+                        </Field>
+                        <Field label="Damage type">
+                          <input
+                            value={action.damageType ?? ''}
+                            onChange={(event) => updateAction(action.id, { damageType: event.target.value })}
+                          />
+                        </Field>
+                        <Field label="Damage on save">
+                          <select
+                            value={action.damageOnSave ?? 'none'}
+                            disabled={action.kind !== 'save'}
+                            onChange={(event) =>
+                              updateAction(action.id, {
+                                damageOnSave: event.target.value as ActionDefinition['damageOnSave'],
+                              })
+                            }
+                          >
+                            <option value="none">Zero</option>
+                            <option value="half">Half</option>
+                          </select>
+                        </Field>
+                        <Field label="Damage application">
+                          <select
+                            value={action.damageApplication ?? 'immediate'}
+                            onChange={(event) =>
+                              updateAction(action.id, { damageApplication: event.target.value as ActionDefinition['damageApplication'] })
+                            }
+                          >
+                            {damageApplicationOptions.map((option) => (
+                              <option key={option} value={option}>
+                                {option}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                        <Field label="Damage trigger">
+                          <select
+                            value={action.damageTrigger ?? 'hit'}
+                            onChange={(event) => updateAction(action.id, { damageTrigger: event.target.value as ActionDefinition['damageTrigger'] })}
+                          >
+                            {damageTriggerOptions.map((option) => (
+                              <option key={option} value={option}>
+                                {option}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                        <Field label="Damage applies to">
+                          <select
+                            value={action.damageAppliesTo ?? 'damage'}
+                            onChange={(event) =>
+                              updateAction(action.id, { damageAppliesTo: event.target.value as ActionDefinition['damageAppliesTo'] })
+                            }
+                          >
+                            {damageAppliesToOptions.map((option) => (
+                              <option key={option} value={option}>
+                                {option}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                        <Field label="Range ft">
+                          <input
+                            type="number"
+                            value={action.rangeFt ?? ''}
+                            onChange={(event) =>
+                              updateAction(action.id, {
+                                rangeFt: event.target.value ? numberValue(event.target.value) : undefined,
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field label="Reach ft">
+                          <input
+                            type="number"
+                            value={action.reachFt ?? ''}
+                            onChange={(event) =>
+                              updateAction(action.id, {
+                                reachFt: event.target.value ? numberValue(event.target.value) : undefined,
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field label="Spell level">
+                          <input
+                            type="number"
+                            min={0}
+                            value={action.spellLevel ?? ''}
+                            onChange={(event) =>
+                              updateAction(action.id, {
+                                spellLevel: event.target.value ? numberValue(event.target.value) : undefined,
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field label="Tags">
+                          <input
+                            value={action.tags.join(', ')}
+                            onChange={(event) =>
+                              updateAction(action.id, {
+                                tags: splitList(event.target.value),
+                              })
+                            }
+                          />
+                        </Field>
+                      </div>
+
+                      <Field label="Description">
+                        <textarea
+                          value={action.description ?? ''}
+                          onChange={(event) => updateAction(action.id, { description: event.target.value })}
+                        />
+                      </Field>
+
+                      <div className="form-grid three">
+                        <Field label="Resource cost">
+                          <input
+                            type="number"
+                            min={0}
+                            value={actionCost?.amount ?? ''}
+                            onChange={(event) =>
+                              updateActionResourceCost(action.id, {
+                                amount: event.target.value ? numberValue(event.target.value) : 0,
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field label="Resource">
+                          <select
+                            value={selectedResourceId}
+                            disabled={!actionCost?.amount}
+                            onChange={(event) => {
+                              const resourceId = event.target.value
+                              updateActionResourceCost(action.id, {
+                                amount: actionCost?.amount ?? 1,
+                                resourceId: resourceId || null,
+                                resourceLabel: resourceId ? combatant.resources.find((resource) => resource.id === resourceId)?.label : null,
+                              })
+                            }}
+                          >
+                            <option value="">Custom label</option>
+                            {combatant.resources.map((resource) => (
+                              <option key={resource.id} value={resource.id}>
+                                {resource.label}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                        <Field label="Resource label">
+                          <input
+                            value={actionCost?.resourceLabel ?? ''}
+                            disabled={!actionCost?.amount}
+                            onChange={(event) =>
+                              updateActionResourceCost(action.id, {
+                                amount: actionCost?.amount ?? 1,
+                                resourceLabel: event.target.value || null,
+                              })
+                            }
+                          />
+                        </Field>
+                      </div>
+
+                      {actionCost?.amount ? (
+                        <button
+                          type="button"
+                          className="small-button"
+                          onClick={() => updateActionResourceCost(action.id, { amount: 0 })}
+                        >
+                          Clear resource cost
+                        </button>
+                      ) : null}
+
+                      <section className="status-add-panel">
+                        <div className="builder-section-title">
+                          <h3>Action effects</h3>
+                          <span>{action.effects?.length ? `${action.effects.length} configured` : 'none'}</span>
+                        </div>
+                        {action.effects?.length ? (
+                          action.effects.map((effect) => (
+                            <article key={effect.id} className="status-card effect-card">
+                              <Field label="Label">
+                                <input
+                                  value={effect.label}
+                                  onChange={(event) =>
+                                    updateActionEffect(action.id, effect.id, {
+                                      label: event.target.value,
+                                    })
+                                  }
+                                />
+                              </Field>
+                              <Field label="Effect text">
+                                <textarea
+                                  value={effect.description}
+                                  onChange={(event) =>
+                                    updateActionEffect(action.id, effect.id, {
+                                      description: event.target.value,
+                                    })
+                                  }
+                                />
+                              </Field>
+                              <button type="button" className="small-button danger" onClick={() => removeActionEffect(action.id, effect.id)}>
+                                Remove effect
+                              </button>
+                            </article>
+                          ))
+                        ) : (
+                          <p className="muted-copy">No effects configured.</p>
+                        )}
+                        <div className="form-grid two">
+                          <Field label="Effect label">
+                            <input value={customEffectLabel} onChange={(event) => setCustomEffectLabel(event.target.value)} />
+                          </Field>
+                          <Field label="Effect description">
+                            <textarea value={customEffectDescription} onChange={(event) => setCustomEffectDescription(event.target.value)} />
+                          </Field>
+                        </div>
+                        <button type="button" className="small-button" onClick={() => addActionEffect(action.id)}>
+                          <Plus size={16} />
+                          Add effect to this action
+                        </button>
+                      </section>
+                    </article>
+                  )
+                })}
+              </div>
+
+              <section className="status-add-panel">
+                <div className="builder-section-title">
+                  <h3>Import action from library</h3>
+                  <span>SRD and imported content actions</span>
+                </div>
+                <div className="form-grid two">
+                  <Field label="Source">
+                    <select
+                      value={selectedLibraryEntry?.id ?? ''}
+                      onChange={(event) => {
+                        const nextEntry = availableActionLibraryEntries.find((entry) => entry.id === event.target.value)
+                        setLibraryActionEntryId(event.target.value)
+                        setLibraryActionId(nextEntry?.actions[0]?.id ?? '')
+                      }}
+                    >
+                      {availableActionLibraryEntries.length ? (
+                        availableActionLibraryEntries.map((entry) => (
+                          <option key={entry.id} value={entry.id}>
+                            {entry.name}
+                          </option>
+                        ))
+                      ) : (
+                        <option value="">No source content available</option>
+                      )}
+                    </select>
+                  </Field>
+                  <Field label="Action">
+                    <select
+                      value={selectedLibraryAction?.id ?? ''}
+                      disabled={!selectedLibraryActions.length}
+                      onChange={(event) => setLibraryActionId(event.target.value)}
+                    >
+                      {selectedLibraryActions.map((action) => (
+                        <option key={action.id} value={action.id}>
+                          {action.name}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                </div>
+                <button type="button" className="primary full-width" disabled={!selectedLibraryAction} onClick={importAction}>
+                  <Plus size={16} />
+                  Import selected action
+                </button>
+              </section>
+
+              <section className="status-add-panel">
+                <div className="builder-section-title">
+                  <h3>New custom action</h3>
+                  <span>Add blank action template</span>
+                </div>
+                <Field label="Custom action name">
+                  <input value={customActionName} onChange={(event) => setCustomActionName(event.target.value)} />
+                </Field>
+                <button type="button" className="primary full-width" onClick={() => addBlankAction()}>
+                  <Plus size={16} />
+                  Add custom action
+                </button>
+              </section>
+            </>
+          ) : (
+            renderConfiguredActionsReadOnly()
+          )}
+        </section>
+        ) : null}
+
+        {showTurnControls ? (
+          <>
+        <section className="planned-action-panel">
+          <div className="builder-section-title">
+            <h3>Planned actions</h3>
+            <span>{plannedActions.length} this round</span>
+          </div>
+          <div className="planned-action-list">
+            {plannedActions.map((plannedAction, index) => {
+              const action = plannedActionDetails[index]
+              const supportsHealingAmount = supportsChosenHealingAmount(action)
+              return (
+                <article key={plannedAction.id} className={`planned-action-row ${supportsHealingAmount ? 'has-heal-amount' : ''}`}>
+                  <div className="planned-action-index">{index + 1}</div>
+                  <Field label="Action">
+                    <select
+                      value={plannedAction.actionId}
+                      onChange={(event) => {
+                        const actionId = event.target.value
+                        const selectedAction = combatant.actions.find((candidate) => candidate.id === actionId)
+                        updatePlannedAction(index, {
+                          actionId,
+                          targetId: isNoActionId(actionId)
+                            ? undefined
+                            : isDamageModifierAction(selectedAction)
+                            ? undefined
+                            : selectedAction?.kind === 'heal'
+                            ? combatant.id
+                            : plannedAction.targetId,
+                          healingAmount: supportsChosenHealingAmount(selectedAction)
+                            ? plannedAction.healingAmount
+                            : undefined,
+                        })
+                      }}
+                    >
+                      <option value={noActionId}>{noActionLabel}</option>
+                      {combatant.actions.map((candidate) => (
+                        <option key={candidate.id} value={candidate.id}>
+                          {candidate.name} · {candidate.kind}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  <Field label="Target">
+                    <select
+                      value={plannedAction.targetId ?? (action?.kind === 'heal' ? combatant.id : '')}
+                      disabled={isNoActionId(plannedAction.actionId)}
+                      onChange={(event) => updatePlannedAction(index, { targetId: event.target.value || undefined })}
+                    >
+                      <option value="">Auto target</option>
+                      {targetOptions.map((target) => (
+                        <option key={target.id} value={target.id}>
+                          {target.name} · {target.side}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  {supportsHealingAmount ? (
+                    <Field label="Heal amount">
+                      <input
+                        type="number"
+                        min={1}
+                        value={plannedAction.healingAmount ?? ''}
+                        onChange={(event) =>
+                          updatePlannedAction(index, {
+                            healingAmount: optionalNumberValue(event.target.value),
+                          })
+                        }
+                      />
+                    </Field>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="icon-button ghost"
+                    aria-label={`Remove action ${index + 1}`}
+                    disabled={plannedActions.length <= 1}
+                    onClick={() => removePlannedAction(index)}
+                  >
+                    -
+                  </button>
+                  <p>{renderPlannedActionPreview(action, plannedAction, index)}</p>
+                </article>
+              )
+            })}
+          </div>
+          <button type="button" className="small-button" onClick={addPlannedAction}>
+            <Plus size={16} />
+            Add action
+          </button>
+        </section>
+
+      <section className="scheduled-action-panel">
+        <div className="builder-section-title">
+          <h3>Scheduled actions</h3>
+          <span>{ownerScheduledActions.length} auto trigger</span>
         </div>
-        <button type="button" className="small-button" onClick={addPlannedAction}>
+        {ownerScheduledActions.length ? (
+          <div className="scheduled-action-list">
+            {ownerScheduledActions.map((scheduledAction, index) => {
+              const isCombatantSpecific = scheduledAction.timingMode !== 'initiativeCount'
+              const initiativeCount = scheduledAction.initiativeCount ?? 0
+
+              return (
+                <article
+                  key={scheduledAction.id}
+                  className={`scheduled-action-row ${scheduledActionHasHealingAmount(scheduledAction) ? 'has-heal-amount' : ''}`}
+                >
+                  <div className="scheduled-action-index">{index + 1}</div>
+                  <Field label="Action">
+                    <select
+                      value={scheduledAction.actionId}
+                      onChange={(event) => {
+                        const actionId = event.target.value
+                        const selectedAction = combatant.actions.find((candidate) => candidate.id === actionId)
+                        updateScheduledActionRow(scheduledAction.id, {
+                          actionId,
+                          targetId: isNoActionId(actionId)
+                            ? undefined
+                            : selectedAction?.kind === 'heal'
+                              ? combatant.id
+                              : scheduledAction.targetId,
+                          healingAmount: supportsChosenHealingAmount(selectedAction) ? scheduledAction.healingAmount : undefined,
+                        })
+                      }}
+                    >
+                      <option value={noActionId}>{noActionLabel}</option>
+                      {combatant.actions.map((candidate) => (
+                        <option key={candidate.id} value={candidate.id}>
+                          {candidate.name} · {candidate.kind}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+
+                  <Field label="Timing">
+                    <select
+                      value={scheduledAction.timingMode}
+                      onChange={(event) => {
+                        const nextMode = event.target.value as ScheduledActionTimingMode
+                        updateScheduledActionRow(scheduledAction.id, {
+                          timingMode: nextMode,
+                          initiativeCount: nextMode === 'initiativeCount' ? initiativeCount : undefined,
+                          triggerCombatantId: nextMode === 'initiativeCount' ? undefined : triggerCombatantOptions[0]?.id,
+                        })
+                      }}
+                    >
+                      {scheduledActionTimingModes.map((mode) => (
+                        <option key={mode} value={mode}>
+                          {scheduledActionTimingLabel(mode)}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+
+                  {isCombatantSpecific ? (
+                    <Field label="Trigger combatant">
+                      <select
+                        value={scheduledAction.triggerCombatantId ?? ''}
+                        onChange={(event) =>
+                          updateScheduledActionRow(scheduledAction.id, { triggerCombatantId: event.target.value || undefined })
+                        }
+                      >
+                        {triggerCombatantOptions.map((target) => (
+                          <option key={target.id} value={target.id}>
+                            {target.name}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                  ) : (
+                    <Field label="Initiative count">
+                      <input
+                        type="number"
+                        value={initiativeCount}
+                        onChange={(event) =>
+                          updateScheduledActionRow(scheduledAction.id, { initiativeCount: Math.trunc(numberValue(event.target.value)) })
+                        }
+                      />
+                    </Field>
+                  )}
+
+                  <Field label="Target">
+                    <select
+                      value={scheduledAction.targetId ?? ''}
+                      disabled={isNoActionId(scheduledAction.actionId)}
+                      onChange={(event) =>
+                        updateScheduledActionRow(scheduledAction.id, { targetId: event.target.value || undefined })
+                      }
+                    >
+                      <option value="">Auto target</option>
+                      {combatants.map((target) => (
+                        <option key={target.id} value={target.id}>
+                          {target.name} · {target.side}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+
+                  {scheduledActionHasHealingAmount(scheduledAction) ? (
+                    <Field label="Heal amount">
+                      <input
+                        type="number"
+                        min={1}
+                        value={scheduledAction.healingAmount ?? ''}
+                        onChange={(event) =>
+                          updateScheduledActionRow(scheduledAction.id, {
+                            healingAmount: optionalNumberValue(event.target.value),
+                          })
+                        }
+                      />
+                    </Field>
+                  ) : null}
+
+                  <button
+                    type="button"
+                    className="icon-button ghost"
+                    aria-label={`Remove scheduled action ${index + 1}`}
+                    onClick={() => onRemoveScheduledAction(scheduledAction.id)}
+                  >
+                    <Minus size={14} />
+                  </button>
+                  <p>{renderScheduledActionPreview(scheduledAction)}</p>
+                </article>
+              )
+            })}
+          </div>
+        ) : (
+          <p className="action-preview-source">No scheduled actions for this combatant.</p>
+        )}
+
+        <button type="button" className="small-button" onClick={addScheduledActionRow}>
           <Plus size={16} />
-          Add action
+          Add scheduled action
         </button>
       </section>
 
@@ -5599,8 +7450,11 @@ function ActionInspector({
           onChange={(event) => onUpdateIntent(combatant.id, { manualNote: event.target.value })}
         />
       </Field>
+          </>
+        ) : null}
     </>
   )
+}
   const renderRollProfileRow = (
     label: string,
     key: RollProfileKey,
@@ -5625,6 +7479,15 @@ function ActionInspector({
           />
           Prof
         </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={config.expertise && config.proficient}
+            disabled={!allowProficiency || !config.proficient}
+            onChange={(event) => updateRollBonus(key, { expertise: event.target.checked })}
+          />
+          Exp
+        </label>
         <input
           type="number"
           aria-label={`${label} bonus`}
@@ -5640,10 +7503,10 @@ function ActionInspector({
     const config = rollBonusConfig(combatant, key)
     const base = abilityModifier(combatant.abilityScores[ability])
     const proficient = combatant.saveProficiencies?.includes(ability) ?? false
-    const total = base + (proficient ? proficiencyBonus : 0) + config.bonus
+    const total = base + (proficient ? proficiencyBonus * (config.expertise ? 2 : 1) : 0) + config.bonus
 
     return (
-      <div key={ability} className="sheet-roll-row">
+      <div key={ability} className="sheet-roll-row roll-profile-row">
         <strong>{ability.toUpperCase()} save</strong>
         <span>{combatant.abilityScores[ability]}</span>
         <span>{signed(base)}</span>
@@ -5655,12 +7518,37 @@ function ActionInspector({
           />
           Prof
         </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={config.expertise && proficient}
+            disabled={!proficient}
+            onChange={(event) => updateRollBonus(key, { expertise: event.target.checked })}
+          />
+          Exp
+        </label>
         <input
           type="number"
           aria-label={`${ability.toUpperCase()} save bonus`}
           value={config.bonus}
           onChange={(event) => updateRollBonus(key, { bonus: numberValue(event.target.value) })}
         />
+        <label>
+          <input
+            type="checkbox"
+            checked={config.advantage}
+            onChange={(event) => updateRollBonus(key, { advantage: event.target.checked })}
+          />
+          Adv
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={config.disadvantage}
+            onChange={(event) => updateRollBonus(key, { disadvantage: event.target.checked })}
+          />
+          Dis
+        </label>
         <em>{signed(total)}</em>
       </div>
     )
@@ -5672,7 +7560,7 @@ function ActionInspector({
     const total = base + rollBonusTotal(combatant, key)
 
     return (
-      <div key={ability} className="sheet-roll-row">
+      <div key={ability} className="sheet-roll-row roll-profile-row">
         <strong>{ability.toUpperCase()} check</strong>
         <span>{combatant.abilityScores[ability]}</span>
         <span>{signed(base)}</span>
@@ -5684,16 +7572,225 @@ function ActionInspector({
           />
           Prof
         </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={config.expertise && config.proficient}
+            disabled={!config.proficient}
+            onChange={(event) => updateRollBonus(key, { expertise: event.target.checked })}
+          />
+          Exp
+        </label>
         <input
           type="number"
           aria-label={`${ability.toUpperCase()} check bonus`}
           value={config.bonus}
           onChange={(event) => updateRollBonus(key, { bonus: numberValue(event.target.value) })}
         />
+        <label>
+          <input
+            type="checkbox"
+            checked={config.advantage}
+            onChange={(event) => updateRollBonus(key, { advantage: event.target.checked })}
+          />
+          Adv
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={config.disadvantage}
+            onChange={(event) => updateRollBonus(key, { disadvantage: event.target.checked })}
+          />
+          Dis
+        </label>
         <em>{signed(total)}</em>
       </div>
     )
   }
+  const renderResourceMeter = (resource: ResourceDefinition) => {
+    const percent = resource.max > 0 ? Math.round((resource.current / resource.max) * 100) : 0
+
+    if (resource.max > 0 && resource.max <= 12) {
+      return (
+        <div className="resource-pips" aria-label={`${resource.label} ${resource.current} of ${resource.max}`}>
+          {Array.from({ length: resource.max }, (_, index) => (
+            <span
+              key={`${resource.id}-pip-${index}`}
+              className={index < resource.current ? 'available' : 'spent'}
+              aria-hidden="true"
+            />
+          ))}
+        </div>
+      )
+    }
+
+    return (
+      <div className="resource-bar" aria-label={`${resource.label} ${resource.current} of ${resource.max}`}>
+        <span style={{ width: `${percent}%` }} />
+      </div>
+    )
+  }
+  const renderResourceRow = (resource: ResourceDefinition) => {
+    const spent = Math.max(0, resource.max - resource.current)
+    const isDepleted = resource.current <= 0
+
+    return (
+      <div key={resource.id} className={`resource-row ${isDepleted ? 'is-empty' : ''}`}>
+        <div className="resource-main">
+          <Field label="Label">
+            <input value={resource.label} onChange={(event) => updateResource(resource.id, { label: event.target.value })} />
+          </Field>
+          <Field label="Recovery">
+            <select
+              value={resource.recovery}
+              onChange={(event) => updateResource(resource.id, { recovery: event.target.value as ResourceDefinition['recovery'] })}
+            >
+              {recoveryKinds.map((recovery) => (
+                <option key={recovery} value={recovery}>
+                  {resourceRecoveryLabel(recovery)}
+                </option>
+              ))}
+            </select>
+          </Field>
+          {resource.recovery === 'recharge' ? (
+            <Field label="Recharge on d6">
+              <input
+                type="number"
+                min={2}
+                max={6}
+                value={resource.rechargeMin ?? 6}
+                onChange={(event) => updateResource(resource.id, { rechargeMin: clampRechargeMin(numberValue(event.target.value)) })}
+              />
+            </Field>
+          ) : null}
+        </div>
+        <div className="resource-visual">
+          {renderResourceMeter(resource)}
+          <span>{spent ? `${spent} spent` : 'ready'}</span>
+        </div>
+        <div className="resource-count">
+          <Field label="Current">
+            <input
+              type="number"
+              min={0}
+              value={resource.current}
+              onChange={(event) => updateResource(resource.id, { current: numberValue(event.target.value) })}
+            />
+          </Field>
+          <Field label="Max">
+            <input
+              type="number"
+              min={0}
+              value={resource.max}
+              onChange={(event) => updateResource(resource.id, { max: numberValue(event.target.value) })}
+            />
+          </Field>
+        </div>
+        <div className="resource-controls">
+          <button
+            type="button"
+            className="icon-button ghost"
+            aria-label={`Spend one use of ${resource.label}`}
+            disabled={isDepleted}
+            onClick={() => updateResource(resource.id, { current: resource.current - 1 })}
+          >
+            <Minus size={14} />
+          </button>
+          <button
+            type="button"
+            className="icon-button ghost"
+            aria-label={`Restore one use of ${resource.label}`}
+            disabled={resource.current >= resource.max}
+            onClick={() => updateResource(resource.id, { current: resource.current + 1 })}
+          >
+            <Plus size={14} />
+          </button>
+          <button type="button" className="small-button danger" onClick={() => removeResource(resource.id)}>
+            Remove
+          </button>
+        </div>
+      </div>
+    )
+  }
+  const renderResourcesSection = () => (
+    <section className={`builder-section character-sheet-section resource-manager-section side-${combatant.side.toLowerCase()}`}>
+      <div className="resource-manager-header">
+        <div>
+          <h3>Resources</h3>
+          <span>
+            {combatant.resources.length
+              ? `${combatant.resources.length} groups · ${resourceRecoverySummary || 'mixed recovery'}`
+              : 'empty tracker'}
+          </span>
+        </div>
+        {combatant.resources.length ? (
+          <button
+            type="button"
+            className="small-button resource-restore-button"
+            aria-label={`Restore all resources for ${combatant.name}`}
+            disabled={allResourcesFull}
+            onClick={restoreAllResources}
+          >
+            <RotateCcw size={14} />
+            Restore all
+          </button>
+        ) : null}
+      </div>
+      {combatant.resources.length ? (
+        <div className="resource-manager-list">{combatant.resources.map(renderResourceRow)}</div>
+      ) : (
+        <div className="resource-empty-state">
+          <strong>No tracked resources</strong>
+          <span>Imported spell slots, class features, and custom uses appear here.</span>
+        </div>
+      )}
+      <section className="status-add-panel">
+        <div className="builder-section-title">
+          <h3>Add resource tracker</h3>
+          <span>Create a custom pool for spell slots, stances, and uses</span>
+        </div>
+        <div className="form-grid three">
+          <Field label="Label">
+            <input
+              value={newResourceLabel}
+              placeholder="Resource name"
+              onChange={(event) => setNewResourceLabel(event.target.value)}
+            />
+          </Field>
+          <Field label="Max">
+            <input type="number" min={0} value={newResourceMax} onChange={(event) => setNewResourceMax(event.target.value)} />
+          </Field>
+          <Field label="Recovery">
+            <select
+              value={newResourceRecovery}
+              onChange={(event) => setNewResourceRecovery(event.target.value as ResourceDefinition['recovery'])}
+            >
+              {recoveryKinds.map((recovery) => (
+                <option key={recovery} value={recovery}>
+                  {resourceRecoveryLabel(recovery)}
+                </option>
+              ))}
+            </select>
+          </Field>
+          {newResourceRecovery === 'recharge' ? (
+            <Field label="Recharge on d6">
+              <input
+                type="number"
+                min={2}
+                max={6}
+                value={newResourceRechargeMin}
+                onChange={(event) => setNewResourceRechargeMin(String(clampRechargeMin(numberValue(event.target.value))))}
+              />
+            </Field>
+          ) : null}
+        </div>
+        <button type="button" className="small-button primary" onClick={addResource}>
+          <Plus size={16} />
+          Add resource
+        </button>
+      </section>
+    </section>
+  )
   const renderDetailsTab = () => (
     <>
       <section className="builder-section character-sheet-section">
@@ -5768,6 +7865,8 @@ function ActionInspector({
         </Field>
       </div>
 
+      {renderResourcesSection()}
+
       <section className="builder-section">
         <div className="builder-section-title">
           <h3>Ability scores</h3>
@@ -5802,6 +7901,7 @@ function ActionInspector({
             <span>Score</span>
             <span>Base</span>
             <span>Prof</span>
+            <span>Exp</span>
             <span>Bonus</span>
             <span>Total</span>
           </div>
@@ -5822,12 +7922,15 @@ function ActionInspector({
           <span>Used by spell and feature save resolution</span>
         </div>
         <div className="sheet-roll-table">
-          <div className="sheet-roll-header">
+          <div className="sheet-roll-header roll-profile-header">
             <span>Save</span>
             <span>Score</span>
             <span>Mod</span>
             <span>Prof</span>
+            <span>Exp</span>
             <span>Bonus</span>
+            <span>Adv</span>
+            <span>Dis</span>
             <span>Total</span>
           </div>
           {abilities.map(renderSaveRow)}
@@ -5840,12 +7943,15 @@ function ActionInspector({
           <span>Stored for manual rulings and future automated checks</span>
         </div>
         <div className="sheet-roll-table">
-          <div className="sheet-roll-header">
+          <div className="sheet-roll-header roll-profile-header">
             <span>Check</span>
             <span>Score</span>
             <span>Mod</span>
             <span>Prof</span>
+            <span>Exp</span>
             <span>Bonus</span>
+            <span>Adv</span>
+            <span>Dis</span>
             <span>Total</span>
           </div>
           {abilities.map(renderCheckRow)}
@@ -5877,10 +7983,6 @@ function ActionInspector({
           <div>
             <span>Vulnerable</span>
             <strong>{combatant.vulnerabilities?.join(', ') || 'none'}</strong>
-          </div>
-          <div>
-            <span>Resources</span>
-            <strong>{combatant.resources.length ? combatant.resources.map((resource) => `${resource.label} ${resource.current}/${resource.max}`).join(', ') : 'none'}</strong>
           </div>
         </div>
       </section>
@@ -6051,6 +8153,42 @@ function ActionInspector({
       </div>
     </section>
   )
+
+  if (presentation === 'catalog') {
+    return (
+      <div className="combatant-detail-stack combatant-build-editor">
+        <div className="stat-chip-grid">
+          {abilities.map((ability) => (
+            <div key={ability}>
+              <span>{ability.toUpperCase()}</span>
+              <strong>{combatant.abilityScores[ability]}</strong>
+              <small>{signed(abilityModifier(combatant.abilityScores[ability]))}</small>
+            </div>
+          ))}
+        </div>
+        <div className="trait-summary-grid">
+          <div>
+            <span>Saves</span>
+            <strong>{combatant.saveProficiencies?.map((ability) => ability.toUpperCase()).join(', ') || 'none'}</strong>
+          </div>
+          <div>
+            <span>Resist</span>
+            <strong>{combatant.resistances?.join(', ') || 'none'}</strong>
+          </div>
+          <div>
+            <span>Immune</span>
+            <strong>{combatant.immunities?.join(', ') || 'none'}</strong>
+          </div>
+          <div>
+            <span>Vulnerable</span>
+            <strong>{combatant.vulnerabilities?.join(', ') || 'none'}</strong>
+          </div>
+        </div>
+        {renderResourcesSection()}
+        {renderActionsTab({ showTurnControls: false })}
+      </div>
+    )
+  }
 
   return (
     <section className="inspector">

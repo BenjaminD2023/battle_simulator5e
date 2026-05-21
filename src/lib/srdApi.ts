@@ -1,4 +1,4 @@
-import type { Ability, ActionDefinition, ContentEntry } from '../types'
+import type { Ability, ActionDefinition, ContentEntry, ResourceDefinition } from '../types'
 import { readCache, writeCache } from './storage'
 
 const API_BASE = 'https://www.dnd5eapi.co'
@@ -240,6 +240,22 @@ const actionId = (name: string) =>
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '')
 
+const rechargeInfoForAction = (action: Pick<SrdMonsterAction, 'name' | 'desc'>) => {
+  const text = `${action.name} ${action.desc ?? ''}`
+  const match = text.match(/recharge\s+([2-6])(?:\s*[-\u2013]\s*6)?/i)
+  if (!match) {
+    return undefined
+  }
+
+  const label = action.name.replace(/\s*\(?\s*recharge\s+[2-6](?:\s*[-\u2013]\s*6)?\s*\)?/i, '').trim() || action.name
+
+  return {
+    id: `${actionId(label)}-recharge`,
+    label,
+    rechargeMin: Number(match[1]),
+  }
+}
+
 const normalizeAbilityIndex = (index?: string): Ability | undefined => {
   const match = index?.match(/(?:saving-throw-|^)(str|dex|con|int|wis|cha)$/)
   return match?.[1] as Ability | undefined
@@ -255,6 +271,14 @@ const normalizeAction = (action: SrdMonsterAction): ActionDefinition => {
   const lowerDescription = action.desc?.toLowerCase() ?? ''
   const rangeMatch = lowerDescription.match(/range\s+(\d+)(?:\/(\d+))?\s*ft/)
   const reachMatch = lowerDescription.match(/reach\s+(\d+)\s*ft/)
+  const recharge = rechargeInfoForAction(action)
+  const resourceCost = recharge
+    ? {
+        resourceId: recharge.id,
+        resourceLabel: recharge.label,
+        amount: 1,
+      }
+    : undefined
 
   if (typeof action.attack_bonus === 'number') {
     return {
@@ -269,6 +293,7 @@ const normalizeAction = (action: SrdMonsterAction): ActionDefinition => {
       target: 'enemy',
       tags: lowerDescription.includes('ranged') ? ['ranged'] : ['melee'],
       description: action.desc,
+      resourceCost,
     }
   }
 
@@ -287,6 +312,7 @@ const normalizeAction = (action: SrdMonsterAction): ActionDefinition => {
       target: 'enemy',
       tags: ['save'],
       description: action.desc,
+      resourceCost,
     }
   }
 
@@ -299,43 +325,69 @@ const normalizeAction = (action: SrdMonsterAction): ActionDefinition => {
     target: 'manual',
     tags: ['manual'],
     description: action.desc,
+    resourceCost,
   }
 }
 
-export const normalizeSrdMonster = (monster: SrdMonster): ContentEntry => ({
-  id: `srd-${monster.index}`,
-  name: monster.name,
-  kind: 'monster',
-  source: {
-    kind: 'SRD',
-    book: 'SRD 5.1',
-    apiIndex: monster.index,
-    apiUrl: `${API_BASE}${monster.url ?? `/api/2014/monsters/${monster.index}`}`,
-    attribution: 'D&D 5e SRD 5.1 CC-BY-4.0',
-  },
-  armorClass: parseArmorClass(monster.armor_class),
-  maxHp: monster.hit_points ?? 1,
-  speedFt: parseSpeed(monster.speed),
-  initiativeBonus: Math.floor(((monster.dexterity ?? 10) - 10) / 2),
-  challenge: String(monster.challenge_rating ?? ''),
-  size: monster.size,
-  type: monster.type,
-  abilityScores: {
-    str: monster.strength ?? 10,
-    dex: monster.dexterity ?? 10,
-    con: monster.constitution ?? 10,
-    int: monster.intelligence ?? 10,
-    wis: monster.wisdom ?? 10,
-    cha: monster.charisma ?? 10,
-  },
-  saveProficiencies: normalizeSaveProficiencies(monster),
-  resistances: monster.damage_resistances ?? [],
-  immunities: [
-    ...(monster.damage_immunities ?? []),
-    ...(monster.condition_immunities?.map((condition) => `${condition.name} condition`) ?? []),
-  ],
-  vulnerabilities: monster.damage_vulnerabilities ?? [],
-  traits: monster.special_abilities?.map((trait) => `${trait.name}: ${trait.desc ?? ''}`) ?? [],
-  resources: [],
-  actions: monster.actions?.map(normalizeAction) ?? [],
-})
+const rechargeResourcesForActions = (actions: SrdMonsterAction[] | undefined): ResourceDefinition[] => {
+  const resources = new Map<string, ResourceDefinition>()
+  actions?.forEach((action) => {
+    const recharge = rechargeInfoForAction(action)
+    if (!recharge || resources.has(recharge.id)) {
+      return
+    }
+
+    resources.set(recharge.id, {
+      id: recharge.id,
+      label: recharge.label,
+      max: 1,
+      current: 1,
+      recovery: 'recharge',
+      rechargeMin: recharge.rechargeMin,
+    })
+  })
+
+  return [...resources.values()]
+}
+
+export const normalizeSrdMonster = (monster: SrdMonster): ContentEntry => {
+  const actions = monster.actions?.map(normalizeAction) ?? []
+
+  return {
+    id: `srd-${monster.index}`,
+    name: monster.name,
+    kind: 'monster',
+    source: {
+      kind: 'SRD',
+      book: 'SRD 5.1',
+      apiIndex: monster.index,
+      apiUrl: `${API_BASE}${monster.url ?? `/api/2014/monsters/${monster.index}`}`,
+      attribution: 'D&D 5e SRD 5.1 CC-BY-4.0',
+    },
+    armorClass: parseArmorClass(monster.armor_class),
+    maxHp: monster.hit_points ?? 1,
+    speedFt: parseSpeed(monster.speed),
+    initiativeBonus: Math.floor(((monster.dexterity ?? 10) - 10) / 2),
+    challenge: String(monster.challenge_rating ?? ''),
+    size: monster.size,
+    type: monster.type,
+    abilityScores: {
+      str: monster.strength ?? 10,
+      dex: monster.dexterity ?? 10,
+      con: monster.constitution ?? 10,
+      int: monster.intelligence ?? 10,
+      wis: monster.wisdom ?? 10,
+      cha: monster.charisma ?? 10,
+    },
+    saveProficiencies: normalizeSaveProficiencies(monster),
+    resistances: monster.damage_resistances ?? [],
+    immunities: [
+      ...(monster.damage_immunities ?? []),
+      ...(monster.condition_immunities?.map((condition) => `${condition.name} condition`) ?? []),
+    ],
+    vulnerabilities: monster.damage_vulnerabilities ?? [],
+    traits: monster.special_abilities?.map((trait) => `${trait.name}: ${trait.desc ?? ''}`) ?? [],
+    resources: rechargeResourcesForActions(monster.actions),
+    actions,
+  }
+}
