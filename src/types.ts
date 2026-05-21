@@ -10,6 +10,12 @@ export type ActionKind = 'attack' | 'save' | 'heal' | 'manual'
 
 export type RollKey = 'attack' | 'save' | 'damage'
 
+export type DamageApplication = 'immediate' | 'modifier'
+
+export type DamageTrigger = 'hit' | 'damage'
+
+export type DamageAppliesTo = 'damage' | 'attack' | 'weaponAttack' | 'meleeWeaponAttack'
+
 export type RollAdjustment = {
   modifier: number
   advantage: boolean
@@ -26,7 +32,10 @@ export type RollProfileKey =
 
 export type RollBonusConfig = {
   proficient: boolean
+  expertise: boolean
   bonus: number
+  advantage: boolean
+  disadvantage: boolean
 }
 
 export type Strategy =
@@ -55,6 +64,15 @@ export type EffectDefinition = {
   description: string
 }
 
+export type SecondaryDamageDefinition = {
+  id: string
+  damageDice: string
+  damageType?: string
+  source?: string
+  condition?: string
+  targetTypes?: string[]
+}
+
 export type CombatantCondition = {
   id: string
   name: string
@@ -76,7 +94,14 @@ export type ResourceDefinition = {
   label: string
   max: number
   current: number
-  recovery: 'round' | 'shortRest' | 'longRest' | 'manual'
+  recovery: 'round' | 'shortRest' | 'longRest' | 'recharge' | 'manual'
+  rechargeMin?: number
+}
+
+export type ResourceCostDefinition = {
+  resourceId?: string
+  resourceLabel?: string
+  amount: number
 }
 
 export type ActionDefinition = {
@@ -92,6 +117,12 @@ export type ActionDefinition = {
   saveDc?: number
   saveAbility?: Ability
   damageOnSave?: 'none' | 'half'
+  damageApplication?: DamageApplication
+  damageTrigger?: DamageTrigger
+  damageAppliesTo?: DamageAppliesTo
+  secondaryDamage?: SecondaryDamageDefinition[]
+  spellLevel?: number
+  resourceCost?: ResourceCostDefinition
   target: 'enemy' | 'ally' | 'self' | 'area' | 'manual'
   tags: string[]
   description?: string
@@ -128,6 +159,16 @@ export type PlannedActionIntent = {
   id: string
   actionId: string
   targetId?: string
+  healingAmount?: number
+}
+
+export type ScheduledActionTimingMode = 'initiativeCount' | 'beforeCombatant' | 'afterCombatant'
+
+export type ScheduledAction = PlannedActionIntent & {
+  ownerCombatantId: string
+  timingMode: ScheduledActionTimingMode
+  initiativeCount?: number
+  triggerCombatantId?: string
 }
 
 export type ActionIntent = {
@@ -154,6 +195,7 @@ export type Combatant = {
   initiativeBonus: number
   level?: number
   proficiencyBonus?: number
+  type?: string
   abilityScores: Record<Ability, number>
   saveProficiencies?: Ability[]
   resistances?: string[]
@@ -187,7 +229,14 @@ export type BattleState = {
   status: BattleStatus
   selectedCombatantId?: string
   combatants: Combatant[]
+  scheduledActions: ScheduledAction[]
+  timelineCursor: BattleTimelineCursor
   log: LogEntry[]
+}
+
+export type BattleTimelineCursor = {
+  round: number
+  itemIndex: number
 }
 
 export type GridCalibration = {

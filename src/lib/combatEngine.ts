@@ -12,11 +12,21 @@ import type {
   RollProfileKey,
   RollAdjustment,
   RollKey,
+  ScheduledAction,
+  ScheduledActionTimingMode,
   Side,
   Strategy,
 } from '../types'
+import {
+  actionSupportsDamageModifier,
+  isDamageModifierAction,
+  isImmediateDamageAction,
+  isNoActionId,
+  noActionId,
+} from './actions'
 import { abilityModifier, createRng, rollD20, rollDamageExpression, rollExpression } from './dice'
 import { gridDistanceFt, stepToward } from './grid'
+import { actionResourceAvailability, resourceCostLabel } from './resources'
 
 const createId = (prefix: string) =>
   `${prefix}-${Math.random().toString(36).slice(2, 9)}-${Date.now().toString(36)}`
@@ -45,61 +55,90 @@ const createRollAdjustments = (): Record<RollKey, RollAdjustment> => ({
   damage: { modifier: 0, advantage: false, disadvantage: false },
 })
 
-export const makeDefaultIntent = (entry: Pick<ContentEntry, 'actions'>) => ({
-  actionId: entry.actions[0]?.id ?? 'manual',
-  actionQueue: [
-    {
-      id: createId('planned-action'),
-      actionId: entry.actions[0]?.id ?? 'manual',
-    },
-  ],
-  advantage: false,
-  disadvantage: false,
-  rollAdjustments: createRollAdjustments(),
-})
+export const makeDefaultIntent = (entry: Pick<ContentEntry, 'actions'>, combatantId?: string) => {
+  const primaryAction = entry.actions[0]
+  const targetId = primaryAction?.kind === 'heal' ? combatantId : undefined
+
+  return {
+    actionId: primaryAction?.id ?? noActionId,
+    actionQueue: [
+      {
+        id: createId('planned-action'),
+        actionId: primaryAction?.id ?? noActionId,
+        targetId,
+      },
+    ],
+    targetId,
+    advantage: false,
+    disadvantage: false,
+    rollAdjustments: createRollAdjustments(),
+  }
+}
 
 export const makeCombatant = (
   entry: ContentEntry,
   side: Side,
   position: GridPoint,
   strategy: Strategy = side === 'Heroes' ? 'manual' : 'nearest',
-): Combatant => ({
-  id: createId('combatant'),
-  contentId: entry.id,
-  name: entry.name,
-  side,
-  source: entry.source,
-  armorClass: entry.armorClass,
-  maxHp: entry.maxHp,
-  currentHp: entry.maxHp,
-  speedFt: entry.speedFt,
-  initiativeBonus: entry.initiativeBonus,
-  level: entry.level,
-  proficiencyBonus: entry.proficiencyBonus,
-  abilityScores: { ...entry.abilityScores },
-  saveProficiencies: [...(entry.saveProficiencies ?? [])],
-  resistances: [...(entry.resistances ?? [])],
-  immunities: [...(entry.immunities ?? [])],
-  vulnerabilities: [...(entry.vulnerabilities ?? [])],
-  position,
-  conditions: [],
-  activeEffects: [],
-  resources: entry.resources.map((resource) => ({ ...resource })),
-  actions: entry.actions.map((action) => ({
-    ...action,
-    tags: [...action.tags],
-    effects: action.effects?.map((effect) => ({ ...effect })),
-  })),
-  rollBonuses: { ...(entry.rollBonuses ?? {}) },
-  strategy,
-  intent: makeDefaultIntent(entry),
-})
+): Combatant => {
+  const id = createId('combatant')
+
+  return {
+    id,
+    contentId: entry.id,
+    name: entry.name,
+    side,
+    source: entry.source,
+    armorClass: entry.armorClass,
+    maxHp: entry.maxHp,
+    currentHp: entry.maxHp,
+    speedFt: entry.speedFt,
+    initiativeBonus: entry.initiativeBonus,
+    level: entry.level,
+    proficiencyBonus: entry.proficiencyBonus,
+    type: entry.type,
+    abilityScores: { ...entry.abilityScores },
+    saveProficiencies: [...(entry.saveProficiencies ?? [])],
+    resistances: [...(entry.resistances ?? [])],
+    immunities: [...(entry.immunities ?? [])],
+    vulnerabilities: [...(entry.vulnerabilities ?? [])],
+    position,
+    conditions: [],
+    activeEffects: [],
+    resources: entry.resources.map((resource) => ({ ...resource })),
+    actions: entry.actions.map((action) => ({
+      ...action,
+      tags: [...action.tags],
+      effects: action.effects?.map((effect) => ({ ...effect })),
+      secondaryDamage: action.secondaryDamage?.map((damage) => ({
+        ...damage,
+        targetTypes: damage.targetTypes ? [...damage.targetTypes] : undefined,
+      })),
+    })),
+    rollBonuses: Object.fromEntries(
+      Object.entries(entry.rollBonuses ?? {}).map(([key, config]) => [
+        key,
+        {
+          proficient: config?.proficient ?? false,
+          expertise: config?.expertise ?? false,
+          bonus: config?.bonus ?? 0,
+          advantage: config?.advantage ?? false,
+          disadvantage: config?.disadvantage ?? false,
+        },
+      ]),
+    ) as Combatant['rollBonuses'],
+    strategy,
+    intent: makeDefaultIntent(entry, id),
+  }
+}
 
 export const makeInitialBattle = (): BattleState => ({
   round: 1,
   seed: `playtest-${new Date().toISOString().slice(0, 10)}`,
   status: 'setup',
   combatants: [],
+  scheduledActions: [],
+  timelineCursor: { round: 1, itemIndex: 0 },
   selectedCombatantId: undefined,
   log: [
     {
@@ -164,24 +203,220 @@ const closeConditionCritical = (target: Combatant, distance: number) =>
 
 const enemySides = (side: Side): Side => (side === 'Heroes' ? 'Monsters' : 'Heroes')
 
-const findAction = (combatant: Combatant): ActionDefinition | undefined =>
-  combatant.actions.find(
-    (action) => action.id === (combatant.intent.actionQueue?.[0]?.actionId ?? combatant.intent.actionId),
-  ) ?? combatant.actions[0]
+export type BattleTimelineItem =
+  | {
+      id: string
+      type: 'turn'
+      combatantId: string
+      initiative: number
+    }
+  | {
+      id: string
+      type: 'scheduledAction'
+      scheduledActionId: string
+      ownerCombatantId: string
+      actionId: string
+      initiative: number
+      timingMode: ScheduledActionTimingMode
+      triggerCombatantId?: string
+    }
+
+const combatantInitiative = (combatant: Combatant) => combatant.initiative ?? 0
+
+const initiativeOrder = (combatants: Combatant[]) =>
+  combatants
+    .map((combatant, index) => ({ combatant, index }))
+    .sort(
+      (a, b) =>
+        combatantInitiative(b.combatant) - combatantInitiative(a.combatant) ||
+        a.index - b.index ||
+        a.combatant.name.localeCompare(b.combatant.name) ||
+        a.combatant.id.localeCompare(b.combatant.id),
+    )
+    .map(({ combatant }) => combatant)
+
+const timelineReadyScheduledActions = (battle: BattleState) => {
+  const combatantById = new Map(battle.combatants.map((combatant) => [combatant.id, combatant]))
+
+  return (battle.scheduledActions ?? []).filter((scheduledAction) => {
+    const owner = combatantById.get(scheduledAction.ownerCombatantId)
+    if (!owner || !living(owner)) {
+      return false
+    }
+
+    if (scheduledAction.timingMode === 'initiativeCount') {
+      return Number.isFinite(scheduledAction.initiativeCount)
+    }
+
+    return Boolean(scheduledAction.triggerCombatantId && combatantById.has(scheduledAction.triggerCombatantId))
+  })
+}
+
+const scheduledActionSorter = (combatants: Combatant[]) => {
+  const orderedCombatants = initiativeOrder(combatants)
+  const combatantById = new Map(combatants.map((combatant) => [combatant.id, combatant]))
+  const orderIndexById = new Map(orderedCombatants.map((combatant, index) => [combatant.id, index]))
+
+  return (a: ScheduledAction, b: ScheduledAction) => {
+    const aOwner = combatantById.get(a.ownerCombatantId)
+    const bOwner = combatantById.get(b.ownerCombatantId)
+    const initiativeDifference = (bOwner?.initiative ?? 0) - (aOwner?.initiative ?? 0)
+
+    return (
+      initiativeDifference ||
+      (orderIndexById.get(a.ownerCombatantId) ?? Number.MAX_SAFE_INTEGER) -
+        (orderIndexById.get(b.ownerCombatantId) ?? Number.MAX_SAFE_INTEGER) ||
+      (aOwner?.name ?? '').localeCompare(bOwner?.name ?? '') ||
+      a.ownerCombatantId.localeCompare(b.ownerCombatantId) ||
+      a.id.localeCompare(b.id)
+    )
+  }
+}
+
+const scheduledTimelineItem = (
+  scheduledAction: ScheduledAction,
+  initiative: number,
+): BattleTimelineItem => ({
+  id: `scheduled:${scheduledAction.id}`,
+  type: 'scheduledAction',
+  scheduledActionId: scheduledAction.id,
+  ownerCombatantId: scheduledAction.ownerCombatantId,
+  actionId: scheduledAction.actionId,
+  initiative,
+  timingMode: scheduledAction.timingMode,
+  triggerCombatantId: scheduledAction.triggerCombatantId,
+})
+
+export const getBattleTimeline = (battle: BattleState): BattleTimelineItem[] => {
+  const combatants = initiativeOrder(battle.combatants)
+  const readyScheduledActions = timelineReadyScheduledActions(battle)
+  const sortScheduledActions = scheduledActionSorter(battle.combatants)
+  const initiativeScheduledActions = new Map<number, ScheduledAction[]>()
+  const beforeCombatantScheduledActions = new Map<string, ScheduledAction[]>()
+  const afterCombatantScheduledActions = new Map<string, ScheduledAction[]>()
+
+  readyScheduledActions.forEach((scheduledAction) => {
+    if (scheduledAction.timingMode === 'initiativeCount') {
+      const initiative = Math.trunc(scheduledAction.initiativeCount ?? 0)
+      initiativeScheduledActions.set(initiative, [...(initiativeScheduledActions.get(initiative) ?? []), scheduledAction])
+      return
+    }
+
+    const triggerCombatantId = scheduledAction.triggerCombatantId
+    if (!triggerCombatantId) {
+      return
+    }
+
+    const byCombatant =
+      scheduledAction.timingMode === 'beforeCombatant'
+        ? beforeCombatantScheduledActions
+        : afterCombatantScheduledActions
+    byCombatant.set(triggerCombatantId, [...(byCombatant.get(triggerCombatantId) ?? []), scheduledAction])
+  })
+
+  const initiativeCounts = new Set<number>([
+    ...combatants.map(combatantInitiative),
+    ...initiativeScheduledActions.keys(),
+  ])
+
+  return [...initiativeCounts]
+    .sort((a, b) => b - a)
+    .flatMap((initiative) => {
+      const turnsAtInitiative = combatants.filter((combatant) => combatantInitiative(combatant) === initiative)
+      const timelineItems: BattleTimelineItem[] = [
+        ...(initiativeScheduledActions.get(initiative) ?? [])
+          .sort(sortScheduledActions)
+          .map((scheduledAction) => scheduledTimelineItem(scheduledAction, initiative)),
+      ]
+
+      turnsAtInitiative.forEach((combatant) => {
+        timelineItems.push(
+          ...(beforeCombatantScheduledActions.get(combatant.id) ?? [])
+            .sort(sortScheduledActions)
+            .map((scheduledAction) => scheduledTimelineItem(scheduledAction, initiative)),
+          {
+            id: `turn:${combatant.id}`,
+            type: 'turn',
+            combatantId: combatant.id,
+            initiative,
+          },
+          ...(afterCombatantScheduledActions.get(combatant.id) ?? [])
+            .sort(sortScheduledActions)
+            .map((scheduledAction) => scheduledTimelineItem(scheduledAction, initiative)),
+        )
+      })
+
+      return timelineItems
+    })
+}
+
+const currentTimelineIndex = (battle: BattleState, timeline = getBattleTimeline(battle)) => {
+  const cursor = battle.timelineCursor
+  const itemIndex =
+    cursor?.round === battle.round && Number.isFinite(cursor.itemIndex)
+      ? Math.trunc(cursor.itemIndex)
+      : 0
+
+  return Math.max(0, Math.min(itemIndex, Math.max(0, timeline.length - 1)))
+}
+
+export const getCurrentTimelineItem = (battle: BattleState) => {
+  const timeline = getBattleTimeline(battle)
+  return timeline[currentTimelineIndex(battle, timeline)]
+}
+
+export const getCurrentTimelineCombatantId = (battle: BattleState) => {
+  const item = getCurrentTimelineItem(battle)
+  if (!item) {
+    return undefined
+  }
+
+  return item.type === 'turn' ? item.combatantId : item.ownerCombatantId
+}
+
+const findAction = (combatant: Combatant): ActionDefinition | undefined => {
+  const actionId = combatant.intent.actionQueue?.[0]?.actionId ?? combatant.intent.actionId
+  if (isNoActionId(actionId)) {
+    return undefined
+  }
+
+  return combatant.actions.find((action) => action.id === actionId) ?? combatant.actions[0]
+}
 
 const findActionById = (combatant: Combatant, actionId: string): ActionDefinition | undefined =>
-  combatant.actions.find((action) => action.id === actionId)
+  isNoActionId(actionId) ? undefined : combatant.actions.find((action) => action.id === actionId)
+
+const defaultTargetIdForAction = (
+  actor: Combatant,
+  action: ActionDefinition | undefined,
+  combatants: Combatant[],
+  strategy: Strategy,
+) =>
+  action?.kind === 'heal' || action?.target === 'self'
+    ? actor.id
+    : chooseTarget(actor, combatants, strategy)?.id
+
+const supportsChosenHealingAmount = (action: ActionDefinition | undefined) =>
+  action?.kind === 'heal' &&
+  (action.tags.some((tag) => ['lay-on-hands', 'heal-pool', 'variable-heal-pool'].includes(tag)) ||
+    /lay on hands/i.test(action.name))
 
 const plannedActionsFor = (combatant: Combatant): PlannedActionIntent[] => {
-  const fallbackActionId = findAction(combatant)?.id ?? combatant.intent.actionId
+  const primaryActionId = combatant.intent.actionQueue?.[0]?.actionId ?? combatant.intent.actionId
+  const fallbackActionId = isNoActionId(primaryActionId) ? noActionId : findAction(combatant)?.id ?? combatant.intent.actionId
   const queue = combatant.intent.actionQueue?.length
     ? combatant.intent.actionQueue
     : [{ id: 'primary-action', actionId: fallbackActionId, targetId: combatant.intent.targetId }]
 
   return queue.map((plannedAction, index) => ({
     id: plannedAction.id ?? `planned-action-${index}`,
-    actionId: findActionById(combatant, plannedAction.actionId)?.id ?? fallbackActionId,
+    actionId: isNoActionId(plannedAction.actionId)
+      ? noActionId
+      : findActionById(combatant, plannedAction.actionId)?.id ?? fallbackActionId,
     targetId: plannedAction.targetId ?? combatant.intent.targetId,
+    healingAmount: supportsChosenHealingAmount(findActionById(combatant, plannedAction.actionId))
+      ? plannedAction.healingAmount
+      : undefined,
   }))
 }
 
@@ -189,13 +424,16 @@ const proficiencyBonus = (combatant: Combatant) => combatant.proficiencyBonus ??
 
 const rollBonusConfig = (combatant: Combatant, key: RollProfileKey): RollBonusConfig => ({
   proficient: combatant.rollBonuses?.[key]?.proficient ?? false,
+  expertise: combatant.rollBonuses?.[key]?.expertise ?? false,
   bonus: combatant.rollBonuses?.[key]?.bonus ?? 0,
+  advantage: combatant.rollBonuses?.[key]?.advantage ?? false,
+  disadvantage: combatant.rollBonuses?.[key]?.disadvantage ?? false,
 })
 
 const rollProfileBonus = (combatant: Combatant, key: RollProfileKey) => {
   const config = rollBonusConfig(combatant, key)
 
-  return config.bonus + (config.proficient ? proficiencyBonus(combatant) : 0)
+  return config.bonus + (config.proficient ? proficiencyBonus(combatant) * (config.expertise ? 2 : 1) : 0)
 }
 
 const getRollAdjustment = (actor: Combatant, key: RollKey): RollAdjustment => ({
@@ -281,27 +519,36 @@ export const rollInitiative = (battle: BattleState): BattleState => {
     })
     .sort((a, b) => (b.initiative ?? 0) - (a.initiative ?? 0))
 
-  return {
+  const nextBattle: BattleState = {
     ...battle,
     status: 'active',
     combatants,
-    selectedCombatantId: battle.selectedCombatantId ?? combatants[0]?.id,
+    selectedCombatantId: combatants[0]?.id,
+    timelineCursor: { round: battle.round, itemIndex: 0 },
     log: [...logs, ...battle.log],
+  }
+
+  return {
+    ...nextBattle,
+    selectedCombatantId: getCurrentTimelineCombatantId(nextBattle) ?? nextBattle.selectedCombatantId,
   }
 }
 
 export const autoPlanRound = (battle: BattleState): BattleState => {
   const combatants = battle.combatants.map((combatant) => {
-    if (!living(combatant) || cannotAct(combatant) || combatant.strategy === 'manual') {
+    const primaryActionId = combatant.intent.actionQueue?.[0]?.actionId ?? combatant.intent.actionId
+    if (!living(combatant) || cannotAct(combatant) || combatant.strategy === 'manual' || isNoActionId(primaryActionId)) {
       return combatant
     }
 
     const target = chooseTarget(combatant, battle.combatants, combatant.strategy)
     const action = chooseStrategyAction(combatant, target)
     const range = action?.rangeFt ?? action?.reachFt ?? 5
+    const targetId = defaultTargetIdForAction(combatant, action, battle.combatants, combatant.strategy)
+    const resolvedTarget = battle.combatants.find((candidate) => candidate.id === targetId)
     const destination =
-      target && gridDistanceFt(combatant.position, target.position) > range
-        ? stepToward(combatant.position, target.position, effectiveSpeed(combatant), range)
+      resolvedTarget && resolvedTarget.id !== combatant.id && gridDistanceFt(combatant.position, resolvedTarget.position) > range
+        ? stepToward(combatant.position, resolvedTarget.position, effectiveSpeed(combatant), range)
         : combatant.position
 
     return {
@@ -313,10 +560,13 @@ export const autoPlanRound = (battle: BattleState): BattleState => {
           {
             id: combatant.intent.actionQueue?.[0]?.id ?? createId('planned-action'),
             actionId: action?.id ?? combatant.intent.actionId,
-            targetId: target?.id,
+            targetId,
+            healingAmount: supportsChosenHealingAmount(action)
+              ? combatant.intent.actionQueue?.[0]?.healingAmount
+              : undefined,
           },
         ],
-        targetId: target?.id,
+        targetId,
         destination,
       },
     }
@@ -426,6 +676,14 @@ const tickStatusDurations = (combatant: Combatant) => ({
     .filter((effect) => effect.durationRounds === undefined || effect.durationRounds > 0),
 })
 
+type ActionResolutionResult = {
+  target: Combatant
+  logs: LogEntry[]
+  landed?: boolean
+  critical?: boolean
+  targetId?: string
+}
+
 const resolveAttack = (
   actor: Combatant,
   target: Combatant,
@@ -459,7 +717,7 @@ const resolveAttack = (
   ]
 
   if (!hit) {
-    return { target, logs }
+    return { target, logs, landed: false, critical: false, targetId: target.id }
   }
 
   const damage = rollDamageExpression(
@@ -484,6 +742,9 @@ const resolveAttack = (
   return {
     target: effectResult.target,
     logs: [...logs, ...effectLogs],
+    landed: true,
+    critical,
+    targetId: target.id,
   }
 }
 
@@ -495,15 +756,20 @@ const resolveSave = (
   round: number,
 ) => {
   const ability = action.saveAbility ?? 'dex'
+  const saveProfile = rollBonusConfig(target, `${ability}Save`)
+  const hasSaveProficiency = target.saveProficiencies?.includes(ability) ?? false
   const saveBonus =
     abilityModifier(target.abilityScores?.[ability] ?? 10) +
-    (target.saveProficiencies?.includes(ability) ? proficiencyBonus(target) : 0) +
-    rollProfileBonus(target, `${ability}Save`)
+    (hasSaveProficiency ? proficiencyBonus(target) * (saveProfile.expertise ? 2 : 1) : 0) +
+    saveProfile.bonus
   const saveAdjustment = getRollAdjustment(actor, 'save')
   const damageAdjustment = getRollAdjustment(actor, 'damage')
   const adjustedSaveBonus = saveBonus + saveAdjustment.modifier
   const forcedFailure = conditionAutoFailsSave(target, ability)
-  const saveD20 = rollD20(rng, rollMode(saveAdjustment, false, conditionSaveDisadvantage(target, ability)))
+  const saveD20 = rollD20(
+    rng,
+    rollMode(saveAdjustment, saveProfile.advantage, saveProfile.disadvantage || conditionSaveDisadvantage(target, ability)),
+  )
   const save = {
     total: saveD20.value + adjustedSaveBonus,
     detail: `${saveD20.mode}; d20 ${saveD20.rolls.join('/')} ${adjustedSaveBonus >= 0 ? '+' : ''}${adjustedSaveBonus}`,
@@ -522,6 +788,9 @@ const resolveSave = (
 
   return {
     target: effectResult.target,
+    landed: appliedDamage > 0,
+    critical: false,
+    targetId: target.id,
     logs: [
       makeLog(
         round,
@@ -542,30 +811,592 @@ const resolveSave = (
   }
 }
 
-const resolveHeal = (
+const secondaryDamageApplies = (target: Combatant, damage: NonNullable<ActionDefinition['secondaryDamage']>[number]) => {
+  if (!damage.targetTypes?.length) {
+    return true
+  }
+
+  const targetType = target.type?.toLowerCase() ?? ''
+  return damage.targetTypes.some((type) => targetType.includes(type.toLowerCase()))
+}
+
+const resolveDamageModifier = (
   actor: Combatant,
   target: Combatant,
   action: ActionDefinition,
   rng: () => number,
   round: number,
-) => {
-  const healing = rollExpression(action.healingDice ?? '1d4', rng)
-  const effectResult = applyActionEffects(applyHealing(target, healing.total), action, actor.name)
+  critical = false,
+): ActionResolutionResult => {
+  const damageAdjustment = getRollAdjustment(actor, 'damage')
+  const damage = rollDamageExpression(
+    withModifier(action.damageDice ?? '0', damageAdjustment.modifier + rollProfileBonus(actor, 'damage')),
+    rng,
+    critical,
+  )
+  const secondaryDamage = (action.secondaryDamage ?? [])
+    .filter((entry) => secondaryDamageApplies(target, entry))
+    .map((entry) => ({
+      definition: entry,
+      roll: rollDamageExpression(entry.damageDice, rng, critical),
+    }))
+  const finalPrimaryDamage = adjustedDamage(target, damage.total, action.damageType)
+  const finalSecondaryDamage = secondaryDamage.reduce(
+    (total, entry) => total + adjustedDamage(target, entry.roll.total, entry.definition.damageType ?? action.damageType),
+    0,
+  )
+  const finalDamage = finalPrimaryDamage + finalSecondaryDamage
+  const damagedTarget = secondaryDamage.reduce(
+    (current, entry) => applyDamage(current, entry.roll.total, entry.definition.damageType ?? action.damageType),
+    applyDamage(target, damage.total, action.damageType),
+  )
+  const effectResult = applyActionEffects(damagedTarget, action, actor.name)
   const effectLogs = effectResult.logs.map((entry) => ({ ...entry, round }))
+  const secondaryDetail = secondaryDamage
+    .map(
+      (entry) =>
+        `${entry.definition.source ?? action.name}${entry.definition.condition ? ` (${entry.definition.condition})` : ''}: ${
+          entry.roll.detail
+        }`,
+    )
+    .join('; ')
 
   return {
     target: effectResult.target,
     logs: [
       makeLog(
         round,
-        `${actor.name} restores ${healing.total} HP to ${target.name} with ${action.name}`,
-        'heal',
+        `${actor.name} adds ${action.name}: ${target.name} takes ${finalDamage} ${action.damageType ?? 'damage'}`,
+        finalDamage > 0 ? 'damage' : 'info',
         actor.name,
-        healing.detail,
+        `${critical ? 'critical modifier; ' : 'modifier; '}${
+          finalPrimaryDamage === damage.total ? damage.detail : `${damage.detail}; adjusted from ${damage.total}`
+        }${secondaryDetail ? `; ${secondaryDetail}` : ''}`,
+      ),
+      ...effectLogs,
+    ],
+    landed: true,
+    critical,
+    targetId: target.id,
+  }
+}
+
+const resolveManualDamage = (
+  actor: Combatant,
+  target: Combatant,
+  action: ActionDefinition,
+  rng: () => number,
+  round: number,
+): ActionResolutionResult => {
+  const damageAdjustment = getRollAdjustment(actor, 'damage')
+  const damage = rollDamageExpression(
+    withModifier(action.damageDice ?? '0', damageAdjustment.modifier + rollProfileBonus(actor, 'damage')),
+    rng,
+  )
+  const finalDamage = adjustedDamage(target, damage.total, action.damageType)
+  const effectResult = applyActionEffects(applyDamage(target, damage.total, action.damageType), action, actor.name)
+  const effectLogs = effectResult.logs.map((entry) => ({ ...entry, round }))
+
+  return {
+    target: effectResult.target,
+    landed: finalDamage > 0,
+    critical: false,
+    targetId: target.id,
+    logs: [
+      makeLog(
+        round,
+        `${actor.name} uses ${action.name}: ${target.name} takes ${finalDamage} ${action.damageType ?? 'damage'}`,
+        finalDamage > 0 ? 'damage' : 'info',
+        actor.name,
+        finalDamage === damage.total ? damage.detail : `${damage.detail}; adjusted from ${damage.total}`,
       ),
       ...effectLogs,
     ],
   }
+}
+
+const resolveHeal = (
+  actor: Combatant,
+  target: Combatant,
+  action: ActionDefinition,
+  plannedAction: PlannedActionIntent | undefined,
+  rng: () => number,
+  round: number,
+) => {
+  const rolledHealing =
+    plannedAction?.healingAmount !== undefined ? undefined : rollExpression(action.healingDice ?? '1d4', rng)
+  const healing = plannedAction?.healingAmount ?? rolledHealing?.total ?? 0
+  const effectResult = applyActionEffects(applyHealing(target, healing), action, actor.name)
+  const effectLogs = effectResult.logs.map((entry) => ({ ...entry, round }))
+
+  return {
+    target: effectResult.target,
+    landed: healing > 0,
+    critical: false,
+    targetId: target.id,
+    logs: [
+      makeLog(
+        round,
+        `${actor.name} restores ${healing} HP to ${target.name} with ${action.name}`,
+        'heal',
+        actor.name,
+        plannedAction?.healingAmount !== undefined ? `planned heal amount ${plannedAction.healingAmount}` : rolledHealing?.detail,
+      ),
+      ...effectLogs,
+    ],
+  }
+}
+
+const spendActionResource = (actor: Combatant, action: ActionDefinition, round: number) => {
+  const availability = actionResourceAvailability(actor, action)
+  if (!availability.cost) {
+    return {
+      actor,
+      available: true,
+      logs: [] as LogEntry[],
+    }
+  }
+
+  const costLabel = resourceCostLabel(availability.cost)
+  if (!availability.resource) {
+    return {
+      actor,
+      available: false,
+      logs: [
+        makeLog(
+          round,
+          `${actor.name} cannot use ${action.name}: missing ${costLabel}.`,
+          'system',
+          actor.name,
+          'Add the resource in Details or import spell slots with the character.',
+        ),
+      ],
+    }
+  }
+
+  if (availability.resource.current < availability.cost.amount) {
+    return {
+      actor,
+      available: false,
+      logs: [
+        makeLog(
+          round,
+          `${actor.name} cannot use ${action.name}: insufficient ${availability.resource.label}.`,
+          'system',
+          actor.name,
+          `${availability.resource.current}/${availability.resource.max} available; needs ${availability.cost.amount}.`,
+        ),
+      ],
+    }
+  }
+
+  const nextCurrent = Math.max(0, availability.resource.current - availability.cost.amount)
+  const updatedActor = {
+    ...actor,
+    resources: actor.resources.map((resource) =>
+      resource.id === availability.resource?.id
+        ? {
+            ...resource,
+            current: nextCurrent,
+          }
+        : resource,
+    ),
+  }
+
+  return {
+    actor: updatedActor,
+    available: true,
+    logs: [
+      makeLog(
+        round,
+        `${actor.name} spends ${costLabel} for ${action.name}.`,
+        'system',
+        actor.name,
+        `${availability.resource.label}: ${nextCurrent}/${availability.resource.max}`,
+      ),
+    ],
+  }
+}
+
+const rechargeThreshold = (resource: { rechargeMin?: number }) =>
+  Math.min(6, Math.max(2, Math.round(resource.rechargeMin ?? 6)))
+
+const rechargeTurnResources = (actor: Combatant, rng: () => number, round: number) => {
+  const logs: LogEntry[] = []
+  let changed = false
+
+  const resources = actor.resources.map((resource) => {
+    if (resource.recovery !== 'recharge' || resource.current >= resource.max) {
+      return resource
+    }
+
+    const threshold = rechargeThreshold(resource)
+    const roll = Math.floor(rng() * 6) + 1
+    const recharged = roll >= threshold
+    logs.push(
+      makeLog(
+        round,
+        recharged
+          ? `${actor.name}'s ${resource.label} recharges.`
+          : `${actor.name}'s ${resource.label} does not recharge.`,
+        recharged ? 'system' : 'info',
+        actor.name,
+        `d6 ${roll}; recharges on ${threshold}-6`,
+      ),
+    )
+
+    if (!recharged) {
+      return resource
+    }
+
+    changed = true
+    return {
+      ...resource,
+      current: resource.max,
+    }
+  })
+
+  return {
+    actor: changed ? { ...actor, resources } : actor,
+    logs,
+  }
+}
+
+const executePlannedActionQueue = (
+  combatants: Combatant[],
+  actorId: string,
+  plannedActions: PlannedActionIntent[],
+  rng: () => number,
+  round: number,
+  logs: LogEntry[],
+) => {
+  let updatedCombatants = combatants
+  let previousTargetId: string | undefined
+  let previousAction: ActionDefinition | undefined
+  let previousActionLanded = false
+  let previousActionCritical = false
+
+  for (const plannedAction of plannedActions) {
+    const actor = updatedCombatants.find((combatant) => combatant.id === actorId)
+    if (!actor) {
+      break
+    }
+
+    let updatedActor = actor
+    if (isNoActionId(plannedAction.actionId)) {
+      logs.push(makeLog(round, `${updatedActor.name} takes no action.`, 'system', updatedActor.name))
+      previousActionLanded = false
+      previousActionCritical = false
+      previousAction = undefined
+      continue
+    }
+
+    const action = findActionById(updatedActor, plannedAction.actionId)
+    if (!action) {
+      logs.push(makeLog(round, `${updatedActor.name} has an unconfigured planned action.`, 'system', updatedActor.name))
+      previousActionLanded = false
+      previousActionCritical = false
+      previousAction = undefined
+      continue
+    }
+
+    const damageModifier = isDamageModifierAction(action)
+    const immediateDamage = isImmediateDamageAction(action)
+    const triggeredTargetId =
+      damageModifier &&
+      !plannedAction.targetId &&
+      previousActionLanded &&
+      actionSupportsDamageModifier(previousAction, action)
+        ? previousTargetId
+        : undefined
+
+    if (damageModifier && !plannedAction.targetId && !triggeredTargetId) {
+      logs.push(
+        makeLog(
+          round,
+          `${updatedActor.name}'s ${action.name} has no compatible landed action to modify.`,
+          'system',
+          updatedActor.name,
+          action.description,
+        ),
+      )
+      previousActionLanded = false
+      previousActionCritical = false
+      previousAction = undefined
+      continue
+    }
+
+    const targetId =
+      plannedAction.targetId ??
+      triggeredTargetId ??
+      defaultTargetIdForAction(
+        updatedActor,
+        action,
+        updatedCombatants,
+        updatedActor.strategy === 'manual' ? 'nearest' : updatedActor.strategy,
+      )
+      ?? updatedActor.intent.targetId
+    let target = updatedCombatants.find((combatant) => combatant.id === targetId)
+
+    if (!target || (!living(target) && !triggeredTargetId)) {
+      logs.push(makeLog(round, `${updatedActor.name} has no legal target for ${action.name}.`, 'system', updatedActor.name))
+      previousActionLanded = false
+      previousActionCritical = false
+      previousAction = undefined
+      continue
+    }
+
+    const range = action.rangeFt ?? action.reachFt ?? 5
+    const distance = gridDistanceFt(updatedActor.position, target.position)
+    if (action.target !== 'self' && !triggeredTargetId && distance > range) {
+      logs.push(
+        makeLog(
+          round,
+          `${updatedActor.name}'s ${action.name} is out of range (${distance} ft > ${range} ft).`,
+          'miss',
+          updatedActor.name,
+        ),
+      )
+      previousActionLanded = false
+      previousActionCritical = false
+      previousAction = undefined
+      continue
+    }
+
+    const resourceSpend = spendActionResource(updatedActor, action, round)
+    if (!resourceSpend.available) {
+      logs.push(...resourceSpend.logs)
+      previousActionLanded = false
+      previousActionCritical = false
+      previousAction = undefined
+      continue
+    }
+
+    if (resourceSpend.actor !== updatedActor) {
+      updatedActor = resourceSpend.actor
+      updatedCombatants = updatedCombatants.map((combatant) =>
+        combatant.id === updatedActor.id ? updatedActor : combatant,
+      )
+      if (target.id === updatedActor.id) {
+        target = updatedActor
+      }
+    }
+    logs.push(...resourceSpend.logs)
+
+    let result: ActionResolutionResult | undefined
+    if (damageModifier) {
+      result = resolveDamageModifier(updatedActor, target, action, rng, round, Boolean(triggeredTargetId && previousActionCritical))
+    } else if (immediateDamage) {
+      result = resolveManualDamage(updatedActor, target, action, rng, round)
+    } else if (action.kind === 'attack') {
+      result = resolveAttack(updatedActor, target, action, rng, round)
+    } else if (action.kind === 'save') {
+      result = resolveSave(updatedActor, target, action, rng, round)
+    } else if (action.kind === 'heal') {
+      result = resolveHeal(updatedActor, target, action, plannedAction, rng, round)
+    } else {
+      const effectResult = applyActionEffects(target, action, updatedActor.name)
+      const effectLogs = effectResult.logs.map((entry) => ({ ...entry, round }))
+      result = {
+        target: effectResult.target,
+        logs: [
+          makeLog(
+            round,
+            `${updatedActor.name}'s ${action.name} needs manual adjudication.`,
+            'system',
+            updatedActor.name,
+            updatedActor.intent.manualNote,
+          ),
+          ...effectLogs,
+        ],
+      }
+    }
+
+    if (result) {
+      logs.push(...result.logs)
+      updatedCombatants = updatedCombatants.map((combatant) =>
+        combatant.id === result?.target.id ? result.target : combatant,
+      )
+      previousTargetId = result.targetId ?? result.target.id
+      previousActionLanded = result.landed ?? true
+      previousActionCritical = result.critical ?? false
+      previousAction = damageModifier ? previousAction : action
+    }
+  }
+
+  return updatedCombatants
+}
+
+const resolveCombatantTurn = (
+  combatants: Combatant[],
+  combatantId: string,
+  rng: () => number,
+  round: number,
+) => {
+  const logs: LogEntry[] = []
+  let actor = combatants.find((combatant) => combatant.id === combatantId)
+
+  if (!actor || !living(actor)) {
+    return { combatants, logs }
+  }
+
+  const rechargeResult = rechargeTurnResources(actor, rng, round)
+  logs.push(...rechargeResult.logs)
+  if (rechargeResult.actor !== actor) {
+    actor = rechargeResult.actor
+    combatants = combatants.map((combatant) => (combatant.id === actor?.id ? actor : combatant))
+  }
+
+  if (cannotAct(actor)) {
+    logs.push(makeLog(round, `${actor.name} cannot act because of a condition.`, 'system', actor.name))
+    return { combatants, logs }
+  }
+
+  const plannedActions = plannedActionsFor(actor)
+  if (!plannedActions.length) {
+    logs.push(makeLog(round, `${actor.name} has no configured actions.`, 'system', actor.name))
+    return { combatants, logs }
+  }
+
+  let updatedCombatants = combatants
+  if (actor.intent.destination) {
+    const distance = gridDistanceFt(actor.position, actor.intent.destination)
+    const speedBudget = effectiveSpeed(actor)
+    const overBudgetFt = Math.max(0, distance - speedBudget)
+    const destination = actor.intent.destination
+
+    logs.push(
+      makeLog(
+        round,
+        `${actor.name} moves ${distance} ft${overBudgetFt > 0 ? ` (${overBudgetFt} ft over speed)` : ''}`,
+        'info',
+        actor.name,
+        `(${actor.position.x}, ${actor.position.y}) to (${destination.x}, ${destination.y})${
+          overBudgetFt > 0 ? ` · Speed ${speedBudget} ft` : ''
+        }`,
+      ),
+    )
+
+    updatedCombatants = updatedCombatants.map((combatant) =>
+      combatant.id === actor.id ? { ...combatant, position: destination } : combatant,
+    )
+  }
+
+  return {
+    combatants: executePlannedActionQueue(updatedCombatants, combatantId, plannedActions, rng, round, logs),
+    logs,
+  }
+}
+
+const resolveScheduledAction = (
+  combatants: Combatant[],
+  scheduledAction: ScheduledAction,
+  rng: () => number,
+  round: number,
+) => {
+  const logs: LogEntry[] = []
+  const actor = combatants.find((combatant) => combatant.id === scheduledAction.ownerCombatantId)
+
+  if (!actor || !living(actor)) {
+    logs.push(
+      makeLog(round, `${scheduledAction.ownerCombatantId} no longer has a valid scheduled action owner.`, 'system', scheduledAction.ownerCombatantId),
+    )
+    return { combatants, logs }
+  }
+
+  if (isNoActionId(scheduledAction.actionId)) {
+    logs.push(makeLog(round, `${actor.name} has a scheduled action that does nothing.`, 'system', actor.name))
+    return { combatants, logs }
+  }
+
+  return {
+    combatants: executePlannedActionQueue(
+      combatants,
+      actor.id,
+      [
+        {
+          id: scheduledAction.id,
+          actionId: scheduledAction.actionId,
+          targetId: scheduledAction.targetId,
+          healingAmount: scheduledAction.healingAmount,
+        },
+      ],
+      rng,
+      round,
+      logs,
+    ),
+    logs,
+  }
+}
+
+const resolveCurrentTimelineItem = (battle: BattleState): BattleState => {
+  const timeline = getBattleTimeline(battle)
+  if (!battle.combatants.length || !timeline.length) {
+    return battle
+  }
+
+  const itemIndex = currentTimelineIndex(battle, timeline)
+  const item = timeline[itemIndex]
+  if (!item) {
+    return battle
+  }
+
+  const rng = createRng(`${battle.seed}:timeline:${battle.round}:${battle.log.length}:${item.id}`)
+  let combatants = battle.combatants
+  let scheduledActions = [...battle.scheduledActions]
+  const logs: LogEntry[] = []
+
+  if (item.type === 'scheduledAction') {
+    const scheduledAction = scheduledActions.find((action) => action.id === item.scheduledActionId)
+    if (!scheduledAction) {
+      logs.push(
+        makeLog(
+          battle.round,
+          `A scheduled action at initiative ${item.initiative} is no longer available and is being skipped.`,
+          'system',
+        ),
+      )
+    } else {
+      const result = resolveScheduledAction(combatants, scheduledAction, rng, battle.round)
+      logs.push(...result.logs)
+      combatants = result.combatants
+      scheduledActions = scheduledActions.filter((action) => action.id !== scheduledAction.id)
+    }
+  } else {
+    const result = resolveCombatantTurn(combatants, item.combatantId, rng, battle.round)
+    logs.push(...result.logs)
+    combatants = result.combatants
+  }
+
+  const roundEnds = itemIndex >= timeline.length - 1
+  const nextRound = roundEnds ? battle.round + 1 : battle.round
+  const nextCombatants = roundEnds ? combatants.map(tickStatusDurations) : combatants
+
+  const nextBattle: BattleState = {
+    ...battle,
+    round: nextRound,
+    combatants: nextCombatants,
+    scheduledActions,
+    timelineCursor: {
+      round: nextRound,
+      itemIndex: roundEnds ? 0 : itemIndex + 1,
+    },
+    status: 'active',
+    log: [
+      ...(roundEnds ? [makeLog(battle.round, `Round ${battle.round} resolved.`, 'system')] : []),
+      ...logs.reverse(),
+      ...battle.log,
+    ],
+  }
+
+  return {
+    ...nextBattle,
+    selectedCombatantId: getCurrentTimelineCombatantId(nextBattle) ?? nextCombatants[0]?.id,
+  }
+}
+
+export const resolveCurrentTurn = (battle: BattleState): BattleState => {
+  return resolveCurrentTimelineItem(battle)
 }
 
 export const resolveRound = (battle: BattleState): BattleState => {
@@ -573,143 +1404,43 @@ export const resolveRound = (battle: BattleState): BattleState => {
     return battle
   }
 
-  const rng = createRng(`${battle.seed}:round:${battle.round}:${battle.log.length}`)
-  let combatants = [...battle.combatants].sort((a, b) => (b.initiative ?? 0) - (a.initiative ?? 0))
-  const logs: LogEntry[] = []
-
-  for (const actorSnapshot of combatants) {
-    const actor = combatants.find((combatant) => combatant.id === actorSnapshot.id)
-
-    if (!actor || !living(actor)) {
-      continue
+  let state = battle
+  while (state.round === battle.round) {
+    const item = getCurrentTimelineItem(state)
+    if (!item) {
+      return state
     }
 
-    if (cannotAct(actor)) {
-      logs.push(makeLog(battle.round, `${actor.name} cannot act because of a condition.`, 'system', actor.name))
-      continue
+    state = resolveCurrentTimelineItem(state)
+
+    if (state.round > battle.round) {
+      return state
     }
 
-    const plannedActions = plannedActionsFor(actor)
-    if (!plannedActions.length) {
-      logs.push(makeLog(battle.round, `${actor.name} has no configured actions.`, 'system', actor.name))
-      continue
-    }
-
-    if (actor.intent.destination) {
-      const distance = gridDistanceFt(actor.position, actor.intent.destination)
-      const speedBudget = effectiveSpeed(actor)
-      const overBudgetFt = Math.max(0, distance - speedBudget)
-      const destination = actor.intent.destination
-
-      logs.push(
-        makeLog(
-          battle.round,
-          `${actor.name} moves ${distance} ft${overBudgetFt > 0 ? ` (${overBudgetFt} ft over speed)` : ''}`,
-          'info',
-          actor.name,
-          `(${actor.position.x}, ${actor.position.y}) to (${destination.x}, ${destination.y})${
-            overBudgetFt > 0 ? ` · Speed ${speedBudget} ft` : ''
-          }`,
-        ),
-      )
-
-      combatants = combatants.map((combatant) =>
-        combatant.id === actor.id ? { ...combatant, position: destination } : combatant,
-      )
-    }
-
-    for (const plannedAction of plannedActions) {
-      const updatedActor = combatants.find((combatant) => combatant.id === actor.id) ?? actor
-      const action = findActionById(updatedActor, plannedAction.actionId)
-
-      if (!action) {
-        logs.push(makeLog(battle.round, `${updatedActor.name} has an unconfigured planned action.`, 'system', updatedActor.name))
-        continue
-      }
-
-      const targetId =
-        plannedAction.targetId ??
-        updatedActor.intent.targetId ??
-        (action.target === 'self'
-          ? updatedActor.id
-          : chooseTarget(updatedActor, combatants, updatedActor.strategy === 'manual' ? 'nearest' : updatedActor.strategy)?.id)
-      const target = combatants.find((combatant) => combatant.id === targetId)
-
-      if (!target || !living(target)) {
-        logs.push(makeLog(battle.round, `${updatedActor.name} has no legal target for ${action.name}.`, 'system', updatedActor.name))
-        continue
-      }
-
-      const range = action.rangeFt ?? action.reachFt ?? 5
-      const distance = gridDistanceFt(updatedActor.position, target.position)
-      if (action.target !== 'self' && distance > range) {
-        logs.push(
-          makeLog(
-            battle.round,
-            `${updatedActor.name}'s ${action.name} is out of range (${distance} ft > ${range} ft).`,
-            'miss',
-            updatedActor.name,
-          ),
-        )
-        continue
-      }
-
-      let result:
-        | {
-            target: Combatant
-            logs: LogEntry[]
-          }
-        | undefined
-
-      if (action.kind === 'attack') {
-        result = resolveAttack(updatedActor, target, action, rng, battle.round)
-      } else if (action.kind === 'save') {
-        result = resolveSave(updatedActor, target, action, rng, battle.round)
-      } else if (action.kind === 'heal') {
-        result = resolveHeal(updatedActor, target, action, rng, battle.round)
-      } else {
-        const effectResult = applyActionEffects(target, action, updatedActor.name)
-        const effectLogs = effectResult.logs.map((entry) => ({ ...entry, round: battle.round }))
-        result = {
-          target: effectResult.target,
-          logs: [
-            makeLog(
-              battle.round,
-              `${updatedActor.name}'s ${action.name} needs manual adjudication.`,
-              'system',
-              updatedActor.name,
-              updatedActor.intent.manualNote,
-            ),
-            ...effectLogs,
-          ],
-        }
-      }
-
-      if (result) {
-        logs.push(...result.logs)
-        combatants = combatants.map((combatant) =>
-          combatant.id === result?.target.id ? result.target : combatant,
-        )
-      }
+    if (item.type === 'scheduledAction') {
+      return state
     }
   }
 
-  const combatantsAfterDurations = combatants.map(tickStatusDurations)
-  const completionLog = [makeLog(battle.round, `Round ${battle.round} resolved.`, 'system')]
+  return state
+}
 
-  return {
-    ...battle,
-    round: battle.round + 1,
-    status: 'active',
-    combatants: combatantsAfterDurations,
-    log: [...completionLog, ...logs.reverse(), ...battle.log],
-  }
+const filterScheduledActions = (combatants: Combatant[], scheduledActions: ScheduledAction[]) => {
+  const combatantIds = new Set(combatants.map((combatant) => combatant.id))
+
+  return scheduledActions.filter((action) => {
+    const hasOwner = combatantIds.has(action.ownerCombatantId)
+    const hasTrigger = action.timingMode === 'initiativeCount' || !action.triggerCombatantId || combatantIds.has(action.triggerCombatantId)
+
+    return hasOwner && hasTrigger
+  })
 }
 
 export const longRestBattle = (battle: BattleState): BattleState => ({
   ...battle,
   status: 'setup',
   round: 1,
+  timelineCursor: { round: 1, itemIndex: 0 },
   combatants: battle.combatants.map((combatant) => ({
     ...combatant,
     currentHp: combatant.maxHp,
@@ -720,14 +1451,16 @@ export const longRestBattle = (battle: BattleState): BattleState => ({
       ...resource,
       current: resource.max,
     })),
-    intent: makeDefaultIntent(combatant),
+    intent: makeDefaultIntent(combatant, combatant.id),
   })),
+  scheduledActions: [],
   log: [makeLog(1, 'Long rest complete. HP, resources, conditions, effects, initiative, and intents reset.', 'system'), ...battle.log],
 })
 
 export const removeDefeated = (battle: BattleState): BattleState => ({
   ...battle,
   combatants: battle.combatants.filter(living),
+  scheduledActions: filterScheduledActions(battle.combatants.filter(living), battle.scheduledActions),
   log: [makeLog(battle.round, 'Removed defeated combatants from the field.', 'system'), ...battle.log],
 })
 
